@@ -321,7 +321,13 @@ def iso(value: datetime) -> str:
 
 
 def parse_dt(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        # Older rows (or hand-edited demo data) may lack an offset. Every
+        # timestamp StockPilot writes is UTC, so assume UTC rather than
+        # crashing on aware/naive arithmetic later.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def new_id(prefix: str) -> str:

@@ -134,7 +134,7 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 **数据层**
 
 - `db.py`：默认单个 SQLite 文件（WAL），三块 module 边界：`inventory_records`（库存）、`listings`/`staging`（商城）、`approvals`（审批），外加 `tasks` 审计记录和 `tool_events` 工具时间线。跨模块提交（改价 + 上架 + 消费审批）在同一个 `BEGIN IMMEDIATE` 事务内完成。`INVENTORY_SCHEMA` / `MALL_SCHEMA` / `ORCHESTRATOR_SCHEMA` 可按 split 布局写入三个文件（`initialize_split_stores`）；`listings` 不再有跨库外键，库存预留字段通过增量迁移补齐。
-- 金额统一用「分」存 SQLite，边界层用 `Decimal`；`models.to_cents/from_cents` 是唯一转换点。
+- 金额统一用「分」存 SQLite，边界层用 `Decimal`；`models.to_cents/from_cents` 是唯一转换点。`db.parse_dt` 把不带时区的历史时间戳按 UTC 解释，避免与 `utcnow()` 做差时抛异常。
 - `staging` 有部分唯一索引：每个 listing 最多存在一条 `price_staged` 提案。
 - 增量迁移在 `initialize_database` 内执行：补 `approvals.decided_by` / `abandoned_at` / `abandon_reason` / `abandoned_by`、`tasks.idempotency_key` 与唯一索引，保证旧 demo 库可直接打开。
 
@@ -225,4 +225,4 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 
 ## 实现状态
 
-工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复（含已提交任务补核对）、任务/审批幂等、工具调用审计、发布前与提交事务内库存复核、遗留提案人工清理、健康检查均已落地；B1 已完成库存/商城两个 Streamable HTTP MCP Server 与静态 Token 角色鉴权；任务、审批、撤回分别留痕提交人 / 审批人 / 撤回人；E1 并发不变量与 E2 观测性（Prometheus 指标、JSON 日志、断线自动重连）已完成。E4 提供一条命令的演示启动器与审批台截图。E3 完成三库分离与发布 saga：内部 `reserve_inventory` / `release_inventory`、提交后响应丢失的只读采纳、跨库恢复扫描与指标、`demo --split`。E5 完成预留 TTL 观测与保守清理：`list_reservations`、`GET/POST /reservations`、恢复扫描分类、指标与审批台按钮。`pytest -q` 当前 111 个用例通过（含并发不变量；并发用例连续 20 次全绿），`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。尚未实现：预留清理的进程内定时调度（当前由 operator 或外部 cron 触发）、通知类 outbox（不重投写）、OIDC / 真实登录、指标接入告警平台与日志聚合、Postgres。
+工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复（含已提交任务补核对）、任务/审批幂等、工具调用审计、发布前与提交事务内库存复核、遗留提案人工清理、健康检查均已落地；B1 已完成库存/商城两个 Streamable HTTP MCP Server 与静态 Token 角色鉴权；任务、审批、撤回分别留痕提交人 / 审批人 / 撤回人；E1 并发不变量与 E2 观测性（Prometheus 指标、JSON 日志、断线自动重连）已完成。E4 提供一条命令的演示启动器与审批台截图。E3 完成三库分离与发布 saga：内部 `reserve_inventory` / `release_inventory`、提交后响应丢失的只读采纳、跨库恢复扫描与指标、`demo --split`。E5 完成预留 TTL 观测与保守清理：`list_reservations`、`GET/POST /reservations`、恢复扫描分类、指标与审批台按钮。`pytest -q` 当前 112 个用例通过（含并发不变量；并发用例连续 20 次全绿），`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。尚未实现：预留清理的进程内定时调度（当前由 operator 或外部 cron 触发）、通知类 outbox（不重投写）、OIDC / 真实登录、指标接入告警平台与日志聚合、Postgres。

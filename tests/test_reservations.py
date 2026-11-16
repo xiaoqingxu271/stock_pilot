@@ -316,6 +316,26 @@ def test_sweep_endpoint_requires_operator_and_updates_metrics(tmp_path):
         assert "stock_pilot_reservations_open 0.0" in client.get("/metrics").text
 
 
+def test_naive_legacy_reservation_timestamp_is_treated_as_utc(
+    settings: Settings, tools: StockPilotTools
+):
+    StockPilotTools(settings)
+    set_reservation(settings.store_inventory, "apr-ghost", "2020-01-01 00:00:00")
+
+    listed = tools.list_reservations()
+    assert listed.ok, listed
+    assert listed.reservations[0].age_seconds > 0
+
+    issues = scan(
+        settings.store_orchestrator,
+        mall_db_path=settings.store_mall,
+        inventory_db_path=settings.store_inventory,
+    )
+    assert any(
+        issue.kind is RecoveryKind.RESERVATION_ORPHANED for issue in issues
+    ), issues
+
+
 def test_reservation_endpoints_are_noops_in_shared_layout(tmp_path):
     settings = Settings(db_path=str(tmp_path / "stock_pilot.db"))
     with TestClient(create_app(settings)) as client:
