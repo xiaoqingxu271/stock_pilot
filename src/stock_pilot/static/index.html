@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#4f46e5">
+  <title>StockPilot 审批台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%234f46e5'/%3E%3Cpath d='M18 42V30M32 42V22M46 42V34' stroke='white' stroke-width='6' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+          <path d="M6 18V11M12 18V6M18 18V14"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1>StockPilot</h1>
+        <p>库存驱动调价 · 人工审批台</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="live" id="live-indicator" title="每 5 秒自动刷新">
+        <span class="live-dot"></span>
+        <span id="live-text">实时同步</span>
+      </span>
+      <button class="btn btn-ghost" id="refresh-btn" type="button">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>
+        </svg>
+        刷新
+      </button>
+    </div>
+  </header>
+
+  <main id="main" class="layout">
+    <section class="stats" aria-label="概览">
+      <article class="stat stat-warn">
+        <div class="stat-top"><span>待审批</span><span class="stat-mark">A</span></div>
+        <strong id="stat-pending">0</strong>
+        <p>调价 + 上架提案</p>
+      </article>
+      <article class="stat stat-info">
+        <div class="stat-top"><span>待确认映射</span><span class="stat-mark">M</span></div>
+        <strong id="stat-mapping">0</strong>
+        <p>同名商品候选</p>
+      </article>
+      <article class="stat stat-accent">
+        <div class="stat-top"><span>进行中</span><span class="stat-mark">R</span></div>
+        <strong id="stat-active">0</strong>
+        <p>已接收 / 待审批 / 已上架</p>
+      </article>
+      <article class="stat stat-success">
+        <div class="stat-top"><span>已结束</span><span class="stat-mark">D</span></div>
+        <strong id="stat-finished">0</strong>
+        <p>核对、回滚或终止</p>
+      </article>
+    </section>
+
+    <div class="grid">
+      <div class="column">
+        <section class="panel" aria-labelledby="approval-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="approval-title">审批队列</h2>
+              <p class="panel-sub">一次审批覆盖「调价 + 上架」，通过前商城价格不变。</p>
+            </div>
+            <span class="count" id="approval-count">0</span>
+          </div>
+          <div id="approval-list" class="stack" aria-live="polite"></div>
+        </section>
+
+        <section class="panel" id="mapping-panel" aria-labelledby="mapping-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="mapping-title">映射确认</h2>
+              <p class="panel-sub">出现同名商品时任务挂起，必须由人选定，系统不会猜。</p>
+            </div>
+            <span class="count count-info" id="mapping-count">0</span>
+          </div>
+          <div id="mapping-list" class="stack" aria-live="polite"></div>
+        </section>
+
+        <section class="panel" aria-labelledby="chain-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="chain-title">执行链路</h2>
+              <p class="panel-sub">每一步失败都会安全停下，不会带病继续。</p>
+            </div>
+          </div>
+          <ol class="chain">
+            <li>
+              <span class="chain-step">01</span>
+              <div class="chain-body">
+                <strong>库存检查</strong>
+                <p>只读；库存 ≤ 0 立即终止，零写入。</p>
+              </div>
+            </li>
+            <li>
+              <span class="chain-step">02</span>
+              <div class="chain-body">
+                <strong>商品映射</strong>
+                <p>同名商品挂起任务，输出候选，等待人工选定。</p>
+              </div>
+            </li>
+            <li>
+              <span class="chain-step">03</span>
+              <div class="chain-body">
+                <strong>调价提案</strong>
+                <p>只写 staging，商城公开价格保持不变。</p>
+              </div>
+            </li>
+            <li>
+              <span class="chain-step">04</span>
+              <div class="chain-body">
+                <strong>人工审批</strong>
+                <p>一次审批覆盖调价 + 上架；拒绝即丢弃提案。</p>
+              </div>
+            </li>
+            <li>
+              <span class="chain-step">05</span>
+              <div class="chain-body">
+                <strong>原子提交</strong>
+                <p>价格、上架状态与审批消费在同一事务内完成。</p>
+              </div>
+            </li>
+            <li>
+              <span class="chain-step">06</span>
+              <div class="chain-body">
+                <strong>最终核对</strong>
+                <p>只读回读价格与状态，结果写入任务记录。</p>
+              </div>
+            </li>
+          </ol>
+        </section>
+      </div>
+
+      <div class="column">
+        <section class="panel" aria-labelledby="new-task-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="new-task-title">提交调价任务</h2>
+              <p class="panel-sub">目标价由调用方给定，Agent 只负责安全执行。</p>
+            </div>
+          </div>
+
+          <div class="scenarios" role="group" aria-label="演示场景">
+            <span class="scenarios-label">演示</span>
+            <button type="button" class="scenario is-active" data-sku="SKU-TSHIRT-001" data-spec="白色-M" data-price="59.00" data-reason="库存驱动调价">正常调价</button>
+            <button type="button" class="scenario" data-sku="SKU-HOODIE-003" data-spec="黑色-L" data-price="99.00" data-reason="清仓测试">库存不足</button>
+            <button type="button" class="scenario" data-sku="SKU-AMBIG-002" data-spec="白色-M" data-price="59.00" data-reason="同名款测试">映射歧义</button>
+          </div>
+
+          <form id="task-form" class="form" novalidate>
+            <div class="field-grid">
+              <label class="field">
+                <span>SKU ID</span>
+                <input id="sku-input" name="sku_id" required value="SKU-TSHIRT-001" list="demo-skus" autocomplete="off" spellcheck="false">
+              </label>
+              <label class="field">
+                <span>规格</span>
+                <input id="spec-input" name="spec" required value="白色-M" autocomplete="off">
+              </label>
+            </div>
+            <label class="field">
+              <span>目标价（元）</span>
+              <input id="price-input" name="target_price" type="number" min="0.01" step="0.01" required value="59.00" inputmode="decimal">
+            </label>
+            <label class="field">
+              <span>调价理由</span>
+              <textarea id="reason-input" name="reason" rows="2" required maxlength="500">库存驱动调价</textarea>
+            </label>
+            <datalist id="demo-skus">
+              <option value="SKU-TSHIRT-001">经典白T恤 · 白色-M · 库存 20</option>
+              <option value="SKU-AMBIG-002">经典白T恤 · 白色-M / 白色-L · 同名歧义</option>
+              <option value="SKU-HOODIE-003">连帽卫衣 · 黑色-L · 库存 0</option>
+            </datalist>
+            <div class="form-actions">
+              <button class="btn btn-primary" id="submit-btn" type="submit">提交任务</button>
+              <p class="form-hint" id="form-hint">提交后先查库存，再确认商品映射。</p>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel" aria-labelledby="tasks-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="tasks-title">任务流水</h2>
+              <p class="panel-sub">每次调用的结果、核对快照和错误码都留痕。</p>
+            </div>
+            <span class="count" id="task-count">0</span>
+          </div>
+          <label class="search">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+            </svg>
+            <input id="task-filter" type="search" placeholder="按 SKU、状态或错误码过滤" autocomplete="off">
+          </label>
+          <div id="task-list" class="task-list" aria-live="polite"></div>
+        </section>
+      </div>
+    </div>
+
+    <footer class="safety">
+      <span>写操作必须审批</span>
+      <span>写超时只读对账</span>
+      <span>拒绝零残留</span>
+      <span>映射歧义不猜测</span>
+    </footer>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

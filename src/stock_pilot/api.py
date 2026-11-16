@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from stock_pilot import approval, tasks
@@ -28,12 +31,15 @@ from stock_pilot.enums import ApprovalStatus, ErrorCode
 from stock_pilot.errors import ToolFailure
 from stock_pilot.models import (
     ApprovalDecisionRequest,
+    ApprovalQueueItem,
     ApprovalView,
     CreateTaskRequest,
     MappingConfirmRequest,
     TaskView,
 )
 from stock_pilot.tools import StockPilotTools
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 _NOT_FOUND = {ErrorCode.APPROVAL_NOT_FOUND, ErrorCode.MAPPING_NOT_FOUND}
 _CONFLICT = {
@@ -77,6 +83,13 @@ def create_app(
     app.state.graph = graph
     app.state.checkpointer = checkpointer
 
+    if STATIC_DIR.exists():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @app.get("/", include_in_schema=False)
+    def approval_ui() -> FileResponse:
+        return FileResponse(STATIC_DIR / "index.html")
+
     @app.post("/tasks", response_model=TaskView, status_code=201)
     def submit_task(request: CreateTaskRequest) -> TaskView:
         return start_task(tools, graph, request)
@@ -115,6 +128,13 @@ def create_app(
         status: ApprovalStatus | None = Query(default=None),
     ) -> list[ApprovalView]:
         return approval.list_approvals(db_path, status)
+
+    @app.get("/approvals/queue", response_model=list[ApprovalQueueItem])
+    def approval_queue(
+        status: ApprovalStatus = Query(default=ApprovalStatus.PENDING),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[ApprovalQueueItem]:
+        return approval.list_queue(db_path, status=status, limit=limit)
 
     @app.get("/approvals/{approval_id}", response_model=ApprovalView)
     def get_approval_record(approval_id: str) -> ApprovalView:

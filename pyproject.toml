@@ -31,6 +31,9 @@ stock-pilot-api = "stock_pilot.api:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+stock_pilot = ["static/*.html", "static/*.css", "static/*.js"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

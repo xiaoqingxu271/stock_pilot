@@ -230,6 +230,16 @@ def test_rejection_rolls_back_without_dirty_state(tools, graph, settings: Settin
     assert record.status is ApprovalStatus.REJECTED
 
 
+def test_second_task_cannot_adopt_another_tasks_approval(tools, graph):
+    first = start_task(tools, graph, request(price="59.00"))
+    assert first.status is TaskStatus.AWAITING_APPROVAL
+
+    second = start_task(tools, graph, request(price="59.00"))
+    assert second.status is TaskStatus.ABORTED_FAILED
+    assert second.error_code is ErrorCode.PENDING_APPROVAL_EXISTS
+    assert second.approval_id is None
+
+
 # ---------------------------------------------------------------------------
 # Write-timeout reconciliation
 # ---------------------------------------------------------------------------

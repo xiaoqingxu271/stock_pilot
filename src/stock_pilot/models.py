@@ -131,6 +131,25 @@ class ApprovalView(BaseModel):
     consumed_at: datetime | None = None
 
 
+class ApprovalQueueItem(BaseModel):
+    """Approval queue entry enriched with listing/task context for the UI."""
+
+    approval_id: str
+    task_id: str | None = None
+    listing_id: str
+    sku_id: str
+    title: str
+    spec: str
+    current_price: Money
+    original_price: Money
+    new_price: Money
+    proposal_reason: str
+    status: ApprovalStatus
+    decision_note: str | None = None
+    created_at: datetime
+    decided_at: datetime | None = None
+
+
 class VerificationResult(BaseModel):
     listing_id: str
     expected_price: Money

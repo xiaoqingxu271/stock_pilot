@@ -90,6 +90,7 @@ python -m venv .venv
 
 # 启动 FastAPI（默认 127.0.0.1:8000）
 ./.venv/Scripts/python.exe -m stock_pilot.api
+# 浏览器打开 http://127.0.0.1:8000/ 即审批台
 
 # 启动 MCP Server（stdio）
 ./.venv/Scripts/python.exe -m stock_pilot.mcp_server
@@ -124,8 +125,9 @@ python -m venv .venv
 
 **服务层**
 
-- `api.py`：三个操作接口 `POST /tasks`、`POST /approvals/{approval_id}/decision`、`POST /tasks/{task_id}/mapping`；另有只读的 `GET /tasks`、`GET /tasks/{id}`、`GET /approvals`、`GET /approvals/{id}`。
+- `api.py`：三个操作接口 `POST /tasks`、`POST /approvals/{approval_id}/decision`、`POST /tasks/{task_id}/mapping`；另有只读的 `GET /tasks`、`GET /tasks/{id}`、`GET /approvals`、`GET /approvals/{id}`、`GET /approvals/queue`（联表返回商品与任务上下文的待审批项）。
 - `tasks.py`：任务记录 CRUD 与 JSON 字段序列化。
+- `static/`：零构建的原生 HTML/CSS/JS 审批台，`GET /` 返回页面。页面每 5 秒自动刷新，审批备注草稿与映射选择在重绘时保留；拒绝必须填写原因。静态资源通过 `pyproject.toml` 的 `package-data` 打进 wheel。
 
 **演示数据（`db.py:_seed_demo_data`）**
 
@@ -141,7 +143,8 @@ python -m venv .venv
 - `tests/test_agent_acceptance.py`：4 条验收用例的图编排断言，另含映射恢复、写超时对账、拒绝/超时后零后续写。
 - `tests/test_runner.py`：超时重试、熔断、写不重试、业务失败不计入熔断。
 - `tests/test_api.py`：三个 FastAPI 操作接口及错误码。
+- `tests/test_ui.py`：审批台静态资源、页面入口、审批队列联表数据与状态过滤。
 
 ## 实现状态
 
-工具层、MCP Server、LangGraph 状态机、FastAPI、验收回归均已落地；`pytest -q` 当前 30 个用例通过。生产化拆分（库存/商城/审批各自独立 MCP Server、真实审批 UI、鉴权、审计日志）尚未实现。
+工具层、MCP Server、LangGraph 状态机、FastAPI、审批台 UI、验收回归均已落地；`pytest -q` 当前 35 个用例通过。生产化拆分（库存/商城/审批各自独立 MCP Server、鉴权、审计日志、真实登录与操作者身份）尚未实现。

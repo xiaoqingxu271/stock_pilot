@@ -13,7 +13,12 @@ from stock_pilot.enums import (
     StagingStatus,
 )
 from stock_pilot.errors import ToolFailure
-from stock_pilot.models import ApprovalView, StagingView, from_cents
+from stock_pilot.models import (
+    ApprovalQueueItem,
+    ApprovalView,
+    StagingView,
+    from_cents,
+)
 
 
 def _approval_view(row: sqlite3.Row) -> ApprovalView:
@@ -82,6 +87,60 @@ def list_approvals(
     finally:
         conn.close()
     return [_approval_view(row) for row in rows]
+
+
+def list_queue(
+    db_path: str,
+    status: ApprovalStatus | None = ApprovalStatus.PENDING,
+    limit: int = 100,
+) -> list[ApprovalQueueItem]:
+    """Approval entries joined with listing and task context for the UI."""
+    sql = (
+        "SELECT a.id AS approval_id, t.id AS task_id, a.listing_id,"
+        " l.sku_id, l.title, l.spec, l.price_cents AS current_price_cents,"
+        " a.original_price_cents, a.new_price_cents, a.proposal_reason,"
+        " a.status, a.decision_note, a.created_at, a.decided_at"
+        " FROM approvals a"
+        " JOIN listings l ON l.id = a.listing_id"
+        " LEFT JOIN ("
+        "   SELECT approval_id, MIN(id) AS id FROM tasks"
+        "   WHERE approval_id IS NOT NULL GROUP BY approval_id"
+        " ) t ON t.approval_id = a.id"
+    )
+    params: list[object] = []
+    if status is not None:
+        sql += " WHERE a.status = ?"
+        params.append(status.value)
+    sql += " ORDER BY a.created_at DESC LIMIT ?"
+    params.append(limit)
+
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+    return [
+        ApprovalQueueItem(
+            approval_id=row["approval_id"],
+            task_id=row["task_id"],
+            listing_id=row["listing_id"],
+            sku_id=row["sku_id"],
+            title=row["title"],
+            spec=row["spec"],
+            current_price=from_cents(row["current_price_cents"]),
+            original_price=from_cents(row["original_price_cents"]),
+            new_price=from_cents(row["new_price_cents"]),
+            proposal_reason=row["proposal_reason"],
+            status=ApprovalStatus(row["status"]),
+            decision_note=row["decision_note"],
+            created_at=parse_dt(row["created_at"]),
+            decided_at=(
+                parse_dt(row["decided_at"]) if row["decided_at"] else None
+            ),
+        )
+        for row in rows
+    ]
 
 
 def decide_approval(

@@ -290,19 +290,23 @@ def build_graph(
                 "status": TaskStatus.AWAITING_APPROVAL.value,
             }
 
+        if result.error_code is ErrorCode.PENDING_APPROVAL_EXISTS:
+            # Someone else's live proposal owns this listing. Never adopt it:
+            # two tasks must not share one approval.
+            return finish(
+                state, TaskStatus.ABORTED_FAILED, result.error_code
+            )
+
         if result.error_code in (
             ErrorCode.TOOL_TIMEOUT,
             ErrorCode.CIRCUIT_OPEN,
-            ErrorCode.PENDING_APPROVAL_EXISTS,
         ):
             adopted = _adopt_reconciled_pending(state)
             if adopted is not None:
                 return adopted
-            code = result.error_code
-            if code is ErrorCode.PENDING_APPROVAL_EXISTS:
-                # A live proposal exists but is not this task's proposal.
-                return finish(state, TaskStatus.ABORTED_FAILED, code)
-            return finish(state, TaskStatus.ABORTED_UNKNOWN_STATE, code)
+            return finish(
+                state, TaskStatus.ABORTED_UNKNOWN_STATE, result.error_code
+            )
 
         return finish(
             state,
