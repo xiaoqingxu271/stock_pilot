@@ -134,6 +134,7 @@ class ApprovalView(BaseModel):
     consumed_at: datetime | None = None
     abandoned_at: datetime | None = None
     abandon_reason: str | None = None
+    abandoned_by: str | None = None
 
 
 class ApprovalQueueItem(BaseModel):
@@ -156,6 +157,7 @@ class ApprovalQueueItem(BaseModel):
     decided_at: datetime | None = None
     abandoned_at: datetime | None = None
     abandon_reason: str | None = None
+    abandoned_by: str | None = None
 
 
 class VerificationResult(BaseModel):

@@ -39,6 +39,7 @@ def test_ui_index_is_served(client):
     assert "/static/app.js" in response.text
     assert "/static/styles.css" in response.text
     assert 'id="operator-name"' in response.text
+    assert 'id="admin-token"' in response.text
     assert 'id="recovery-panel"' in response.text
 
 
@@ -53,6 +54,8 @@ def test_ui_static_assets_are_served(client):
     assert "refresh" in js.text
     assert "/recovery" in js.text
     assert "decided_by" in js.text
+    assert "admin-token" in js.text
+    assert "Authorization" in js.text
     assert "/abandon" in js.text
     assert "staging_orphaned" in js.text
     assert "published_verify_pending" in js.text

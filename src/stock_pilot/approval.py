@@ -39,6 +39,7 @@ def _approval_view(row: sqlite3.Row) -> ApprovalView:
             parse_dt(row["abandoned_at"]) if row["abandoned_at"] else None
         ),
         abandon_reason=row["abandon_reason"],
+        abandoned_by=row["abandoned_by"],
     )
 
 
@@ -105,7 +106,7 @@ def list_queue(
         " l.sku_id, l.title, l.spec, l.price_cents AS current_price_cents,"
         " a.original_price_cents, a.new_price_cents, a.proposal_reason,"
         " a.status, a.decision_note, a.decided_by, a.created_at, a.decided_at,"
-        " a.abandoned_at, a.abandon_reason"
+        " a.abandoned_at, a.abandon_reason, a.abandoned_by"
         " FROM approvals a"
         " JOIN listings l ON l.id = a.listing_id"
         " LEFT JOIN ("
@@ -149,6 +150,7 @@ def list_queue(
                 parse_dt(row["abandoned_at"]) if row["abandoned_at"] else None
             ),
             abandon_reason=row["abandon_reason"],
+            abandoned_by=row["abandoned_by"],
         )
         for row in rows
     ]
@@ -221,15 +223,26 @@ def decide_approval(
 
 
 def abandon_approval(
-    db_path: str, approval_id: str, reason: str
+    db_path: str,
+    approval_id: str,
+    reason: str,
+    abandoned_by: str | None = None,
 ) -> ApprovalView:
     """Withdraw an approved proposal before it reaches the mall.
 
-    Used by the publish-time inventory recheck. The approval is marked
-    ``abandoned`` (not a human rejection) and its live staging row is
-    discarded in the same transaction. Repeating the call is safe.
+    Used by the publish-time inventory recheck and by manual cleanup. The
+    approval is marked ``abandoned`` (not a human rejection) and its live
+    staging row is discarded in the same transaction. Repeating the call is
+    safe; the first operator remains on record.
     """
     now = iso(utcnow())
+    operator = abandoned_by.strip() if abandoned_by is not None else None
+    if operator == "":
+        operator = None
+    if operator is not None and len(operator) > 64:
+        raise ToolFailure(
+            ErrorCode.VALIDATION_ERROR, "abandoned_by must be at most 64 characters"
+        )
 
     with transaction(db_path) as tx:
         row = tx.execute(
@@ -264,9 +277,9 @@ def abandon_approval(
             )
 
         tx.execute(
-            "UPDATE approvals SET status = ?, abandoned_at = ?, abandon_reason = ?"
-            " WHERE id = ?",
-            (ApprovalStatus.ABANDONED.value, now, reason, approval_id),
+            "UPDATE approvals SET status = ?, abandoned_at = ?, abandon_reason = ?,"
+            " abandoned_by = ? WHERE id = ?",
+            (ApprovalStatus.ABANDONED.value, now, reason, operator, approval_id),
         )
         tx.execute(
             "UPDATE staging SET status = ?, updated_at = ?"

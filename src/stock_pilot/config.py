@@ -21,6 +21,14 @@ class Settings:
     read_max_retries: int = 2
     circuit_failure_threshold: int = 3
     circuit_cooldown_seconds: float = 30.0
+    # Production split: two HTTP MCP servers over a shared demo database.
+    inventory_mcp_url: str = "http://127.0.0.1:8101/mcp"
+    mall_mcp_url: str = "http://127.0.0.1:8102/mcp"
+    # Static bearer tokens. With no tokens configured the demo runs in
+    # unauthenticated dev mode; configuring any token enforces role checks.
+    agent_token: str | None = None
+    operator_token: str | None = None
+    admin_token: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -34,4 +42,13 @@ class Settings:
             circuit_cooldown_seconds=float(
                 os.environ.get("STOCK_PILOT_CIRCUIT_COOLDOWN", "30")
             ),
+            inventory_mcp_url=os.environ.get(
+                "STOCK_PILOT_INVENTORY_URL", "http://127.0.0.1:8101/mcp"
+            ),
+            mall_mcp_url=os.environ.get(
+                "STOCK_PILOT_MALL_URL", "http://127.0.0.1:8102/mcp"
+            ),
+            agent_token=os.environ.get("STOCK_PILOT_AGENT_TOKEN") or None,
+            operator_token=os.environ.get("STOCK_PILOT_OPERATOR_TOKEN") or None,
+            admin_token=os.environ.get("STOCK_PILOT_ADMIN_TOKEN") or None,
         )

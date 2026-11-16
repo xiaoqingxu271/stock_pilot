@@ -16,12 +16,12 @@ import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from stock_pilot import approval, audit, mall, recovery, tasks
+from stock_pilot import approval, audit, auth, mall, recovery, tasks
 from stock_pilot.agent import (
     build_graph,
     confirm_mapping_and_resume,
@@ -30,6 +30,7 @@ from stock_pilot.agent import (
     start_task,
     verify_published_task,
 )
+from stock_pilot.auth import Principal, Role
 from stock_pilot.clients import ToolClient, create_tool_client
 from stock_pilot.config import Settings
 from stock_pilot.db import utcnow
@@ -124,6 +125,36 @@ def create_app(
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    def _require(role: Role):
+        """Enforce the role for a mutating endpoint.
+
+        No configured tokens means local demo mode (returns ``None``). As soon
+        as any token exists, every mutation requires an appropriate token.
+        """
+
+        def dependency(
+            authorization: str | None = Header(
+                default=None, alias="Authorization"
+            ),
+        ) -> Principal | None:
+            principal = auth.principal_from_authorization(settings, authorization)
+            if principal is not None:
+                if not auth.permits(principal, role):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"role {role.value!r} required",
+                    )
+                return principal
+            if not auth.auth_enabled(settings):
+                return None
+            raise HTTPException(
+                status_code=401,
+                detail="missing or invalid bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        return dependency
+
     @app.get("/", include_in_schema=False)
     def approval_ui() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
@@ -147,6 +178,7 @@ def create_app(
     def submit_task(
         request: CreateTaskRequest,
         response: Response,
+        _principal: Principal | None = Depends(_require(Role.AGENT)),
         idempotency_key: str | None = Header(
             default=None, alias="Idempotency-Key", max_length=128
         ),
@@ -238,7 +270,10 @@ def create_app(
         )
 
     @app.post("/tasks/{task_id}/recover", response_model=TaskView)
-    def recover_task(task_id: str) -> TaskView:
+    def recover_task(
+        task_id: str,
+        _principal: Principal | None = Depends(_require(Role.OPERATOR)),
+    ) -> TaskView:
         task = tasks.get_task(db_path, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
@@ -278,7 +313,11 @@ def create_app(
         return resume_task(client, graph, task_id, {"recovered": True})
 
     @app.post("/tasks/{task_id}/mapping", response_model=TaskView)
-    def confirm_mapping(task_id: str, request: MappingConfirmRequest) -> TaskView:
+    def confirm_mapping(
+        task_id: str,
+        request: MappingConfirmRequest,
+        _principal: Principal | None = Depends(_require(Role.OPERATOR)),
+    ) -> TaskView:
         try:
             return confirm_mapping_and_resume(
                 client, graph, task_id, request.listing_id
@@ -287,7 +326,13 @@ def create_app(
             raise _http_error(exc) from exc
 
     @app.post("/approvals/{approval_id}/decision", response_model=TaskView)
-    def decide(approval_id: str, request: ApprovalDecisionRequest) -> TaskView:
+    def decide(
+        approval_id: str,
+        request: ApprovalDecisionRequest,
+        principal: Principal | None = Depends(_require(Role.OPERATOR)),
+    ) -> TaskView:
+        # With authentication on, the token identity wins over the body.
+        decided_by = principal.name if principal is not None else request.decided_by
         try:
             return decide_and_resume(
                 client,
@@ -295,20 +340,28 @@ def create_app(
                 approval_id,
                 request.decision,
                 request.note,
-                request.decided_by,
+                decided_by,
             )
         except ToolFailure as exc:
             raise _http_error(exc) from exc
 
     @app.post("/approvals/{approval_id}/abandon", response_model=ApprovalView)
     def abandon_approval_record(
-        approval_id: str, request: AbandonApprovalRequest
+        approval_id: str,
+        request: AbandonApprovalRequest,
+        principal: Principal | None = Depends(_require(Role.OPERATOR)),
     ) -> ApprovalView:
+        abandoned_by = principal.name if principal is not None else None
         current = approval.get_approval(db_path, approval_id)
         if current is None:
             raise HTTPException(status_code=404, detail="approval not found")
         if current.status is ApprovalStatus.ABANDONED:
-            return client.abandon_approval(approval_id, request.reason)
+            try:
+                return client.abandon_approval(
+                    approval_id, request.reason, abandoned_by
+                )
+            except ToolFailure as exc:
+                raise _http_error(exc) from exc
         if current.status is not ApprovalStatus.APPROVED:
             raise _http_error(
                 ToolFailure(
@@ -369,7 +422,7 @@ def create_app(
             )
 
         try:
-            return client.abandon_approval(approval_id, request.reason)
+            return client.abandon_approval(approval_id, request.reason, abandoned_by)
         except ToolFailure as exc:
             raise _http_error(exc) from exc
 

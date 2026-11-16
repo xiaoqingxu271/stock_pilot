@@ -64,6 +64,7 @@
     recoveryPanel: $("#recovery-panel"),
     recoveryList: $("#recovery-list"),
     recoveryCount: $("#recovery-count"),
+    adminToken: $("#admin-token"),
     operator: $("#operator-name"),
     approvalList: $("#approval-list"),
     approvalCount: $("#approval-count"),
@@ -94,10 +95,13 @@
   }
 
   function api(path, options = {}) {
-    return fetch(path, {
-      headers: { "Content-Type": "application/json" },
-      ...options,
-    }).then(async (response) => {
+    const headers = {
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    };
+    const token = refs.adminToken ? refs.adminToken.value.trim() : "";
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return fetch(path, { ...options, headers }).then(async (response) => {
       const raw = await response.text();
       let body = null;
       if (raw) {
@@ -934,14 +938,24 @@
 
   function bindOperator() {
     const key = "stockPilotOperator";
+    const tokenKey = "stockPilotAdminToken";
     try {
       refs.operator.value = window.localStorage.getItem(key) || "";
+      refs.adminToken.value = window.sessionStorage.getItem(tokenKey) || "";
     } catch {
-      // Storage may be unavailable; the field still works for this page.
+      // Storage may be unavailable; the fields still work for this page.
     }
     refs.operator.addEventListener("input", () => {
       try {
         window.localStorage.setItem(key, refs.operator.value.trim());
+      } catch {
+        // Ignore storage failures.
+      }
+    });
+    // Keep the bearer token in sessionStorage: it dies with the tab.
+    refs.adminToken.addEventListener("input", () => {
+      try {
+        window.sessionStorage.setItem(tokenKey, refs.adminToken.value.trim());
       } catch {
         // Ignore storage failures.
       }

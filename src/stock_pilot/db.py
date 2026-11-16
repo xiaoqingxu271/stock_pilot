@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided_at           TEXT,
     consumed_at          TEXT,
     abandoned_at         TEXT,
-    abandon_reason       TEXT
+    abandon_reason       TEXT,
+    abandoned_by         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 
@@ -166,6 +167,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "approvals", "decided_by", "decided_by TEXT")
     _ensure_column(conn, "approvals", "abandoned_at", "abandoned_at TEXT")
     _ensure_column(conn, "approvals", "abandon_reason", "abandon_reason TEXT")
+    _ensure_column(conn, "approvals", "abandoned_by", "abandoned_by TEXT")
     _ensure_column(conn, "tasks", "idempotency_key", "idempotency_key TEXT")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_idempotency_key"

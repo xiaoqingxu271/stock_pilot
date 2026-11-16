@@ -22,6 +22,7 @@ check_inventory → get_listing → update_price（审批）
 | 写超时 | 只做一次只读 `get_listing` 对账；对账失败进入 `ABORTED_UNKNOWN_STATE`，绝不重发写操作 |
 | 进程中断 | 重启后 `GET /recovery` 显式列出异常态；已审批提案可安全恢复，未审批任务沿用原流程 |
 | 重复请求 | `Idempotency-Key` 保证 `POST /tasks` 不重复建任务；重复审批返回当前结果 |
+| 操作人身份 | 配置 Token 后写接口按角色校验；`decided_by` / `abandoned_by` 取自身份，不信任请求体 |
 
 ## 架构
 
@@ -60,7 +61,10 @@ check_inventory → get_listing → update_price（审批）
 
 - `STOCK_PILOT_TOOL_CLIENT=inprocess`（默认）：工具在编排进程内执行，便于测试。
 - `STOCK_PILOT_TOOL_CLIENT=mcp`：四个工具真实走 MCP stdio，客户端自动拉起 Server 子进程。
+- `STOCK_PILOT_TOOL_CLIENT=mcp-http`：库存与商城拆成两个独立 MCP Server（Streamable HTTP），客户端按工具路由到对应服务，携带 `STOCK_PILOT_AGENT_TOKEN`。
 - 审批队列读写与决策留在编排进程本地，因为审批台是人机管理面，不属于四个 MCP 工具。
+
+**鉴权（B1）**：`STOCK_PILOT_AGENT_TOKEN` / `STOCK_PILOT_OPERATOR_TOKEN` / `STOCK_PILOT_ADMIN_TOKEN` 配置静态 Bearer Token。任一 Token 存在即启用校验：提交任务需 agent（admin 亦可），审批、映射确认、恢复、撤回需 operator（admin 亦可）；带身份时 `decided_by` / `abandoned_by` 取自身份，忽略请求体伪装。只读接口为演示便利保持开放，生产应置于网关之后。两个 HTTP MCP Server 同样只接受 agent Token。审批台的「管理令牌」输入框会附带 Bearer 头（存于 sessionStorage，关闭标签页即失效），填入 admin Token 即可在启用鉴权时操作全流程。未配置任何 Token 时保持本地演示模式。
 
 **两阶段提交**：`update_price` 在同一事务里写 `staging` 和 `approvals`，商城不可见；审批通过后 `publish_listing` 在同一事务内完成「改价 + 上架 + 消费审批」。因此不存在「价格已改但未上架」的中间脏状态。
 
@@ -84,6 +88,13 @@ python -m venv .venv
 
 # 真实 MCP stdio 模式
 STOCK_PILOT_TOOL_CLIENT=mcp ./.venv/Scripts/python.exe -m stock_pilot.api
+
+# B1：库存 / 商城两个 HTTP MCP Server + 编排进程
+export STOCK_PILOT_AGENT_TOKEN=demo-agent-token
+export STOCK_PILOT_OPERATOR_TOKEN=demo-operator-token
+./.venv/Scripts/python.exe -m stock_pilot.mcp_inventory &   # 127.0.0.1:8101/mcp
+./.venv/Scripts/python.exe -m stock_pilot.mcp_mall &        # 127.0.0.1:8102/mcp
+STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 
 # 全量回归
 ./.venv/Scripts/python.exe -m pytest -q
@@ -122,6 +133,8 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 
 审批决策是幂等的：重复提交相同决策返回当前任务；提交相反决策返回 `409`。
 
+配置了 Token 时：`POST /tasks` 需 agent（或 admin）；`POST /tasks/{id}/mapping`、`POST /tasks/{id}/recover`、`POST /approvals/{id}/decision`、`POST /approvals/{id}/abandon` 需 operator（或 admin）。缺少 / 错误 Token 返回 `401`，角色不足返回 `403`。
+
 ## 失败语义
 
 | 错误码 | 任务终态 | 后续写操作 |
@@ -138,7 +151,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 67 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 76 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -149,6 +162,8 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_api.py`：FastAPI 操作接口、错误码与就绪检查。
 - `tests/test_ui.py`：审批台静态资源、队列联表、恢复入口与遗留提案清理。
 - `tests/test_mcp_client.py`：真实 MCP stdio 全链路、API/MCP 模式、服务不可用或中途退出时安全终止。
+- `tests/test_mcp_http.py`：两个 Streamable HTTP MCP Server 的工具路由、完整图链路、Bearer 校验与未授权时安全终止。
+- `tests/test_auth.py`：角色鉴权、跨角色拒绝、身份覆盖请求体、撤回操作人留痕。
 - `tests/test_recovery.py`：进程重启、幂等提交、审批幂等、操作者身份、工具时间线、恢复接口（含已提交任务只读核对）、发布前与事务内库存复核、遗留提案撤回。
 
 ## 目录
@@ -161,26 +176,30 @@ src/stock_pilot/
   mall.py         商城模块（get_listing / update_price / publish_listing）
   approval.py     审批模块（人机管理面）
   tools.py        进程内工具门面
-  clients.py      ToolClient 边界 + MCPToolClient
+  clients.py      ToolClient 边界 + stdio / 拆分 HTTP 客户端
   runner.py       超时 / 重试 / 熔断 / 审计事件
   audit.py        工具调用时间线
+  auth.py         静态 Bearer Token 与角色
   recovery.py     只读重启对账
   agent.py        LangGraph 状态机
   api.py          FastAPI + 静态审批台
-  mcp_server.py   MCP Server（4 个工具）
+  mcp_server.py   MCP 工具注册（单 Server / 拆分 Server 共用）
+  mcp_http.py     Streamable HTTP + Bearer 中间件
+  mcp_inventory.py 库存 MCP Server（HTTP）
+  mcp_mall.py      商城 MCP Server（HTTP）
   static/         零构建审批台
-tests/            验收、单元、API、UI、MCP、恢复
+tests/            验收、单元、API、UI、MCP、鉴权、恢复
 ```
 
 ## 设计取舍与生产化
 
-第一版刻意保持单 SQLite、单 MCP Server，用 module 边界隔离库存 / 商城 / 审批，便于在本地演示完整闭环和故障路径。
+第一版刻意保持单 SQLite、单 MCP Server，用 module 边界隔离库存 / 商城 / 审批，便于在本地演示完整闭环和故障路径。B1 已把库存与商城拆成两个独立的 Streamable HTTP MCP Server，并加上静态 Token 角色鉴权；审批面按决策留在编排进程，因为它是人机管理面而非模型工具。
 
-生产化拆分方向：
+生产化继续拆分方向：
 
-1. 库存、商城、审批各自独立 MCP Server，走 Streamable HTTP + 服务间鉴权。
+1. 两个工具 Server 各自持有独立数据库与服务间鉴权；当前演示仍共享同一个 SQLite 文件。
 2. Postgres 替换 SQLite；跨服务提交从单库事务改为 saga / 补偿，明确每一步的一致性边界。
-3. 真实登录与角色：审批人不能是提交人，审批接口不再裸奔。
+3. 静态 Token 换成 OIDC / 真实登录，并强制审批人与提交人分离；只读接口纳入统一鉴权与网关。
 4. 结构化日志、指标、告警与审批审计导出。
 
-已知限制：当前操作者身份由审批台填写，不是认证；SQLite 适合单实例演示；MCP 模式默认只拉起一个 Server 子进程。
+已知限制：共享 SQLite 适合单实例演示，拆分 Server 只是拓扑演练；只读接口未鉴权；静态 Token 没有轮换与细粒度权限。

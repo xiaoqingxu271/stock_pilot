@@ -3,6 +3,12 @@
 MCP 2.x renamed ``FastMCP`` to ``MCPServer``. Tools accept flat arguments
 (the MCP wire contract) and immediately build the Pydantic input model, so
 all validation and output schemas are Pydantic-based.
+
+The same registration helpers back three deployments:
+
+* ``build_mcp_server`` - one stdio server with all four tools (default demo)
+* ``build_inventory_server`` - read-only inventory tools for the split setup
+* ``build_mall_server`` - listing lookup plus both approval-gated writes
 """
 
 from __future__ import annotations
@@ -24,18 +30,16 @@ from stock_pilot.models import (
 )
 from stock_pilot.tools import StockPilotTools
 
+READ_ONLY_INSTRUCTIONS = (
+    "Read-only tools. Never infer or guess; report ambiguity instead."
+)
 
-def build_mcp_server(tools: StockPilotTools | None = None) -> MCPServer:
-    tools = tools or StockPilotTools()
-    server = MCPServer(
-        name="stock-pilot",
-        instructions=(
-            "Inventory-driven repricing. Reads are safe; update_price and "
-            "publish_listing only ever act through the approval queue. Never "
-            "guess when get_listing returns ambiguous."
-        ),
-    )
 
+def _new_server(name: str, instructions: str) -> MCPServer:
+    return MCPServer(name=name, instructions=instructions)
+
+
+def register_inventory_tools(server: MCPServer, tools: StockPilotTools) -> None:
     @server.tool(
         name="check_inventory",
         description=(
@@ -48,6 +52,8 @@ def build_mcp_server(tools: StockPilotTools | None = None) -> MCPServer:
         request = CheckInventoryInput(sku_id=sku_id, spec=spec)
         return await asyncio.to_thread(tools.check_inventory, request)
 
+
+def register_mall_tools(server: MCPServer, tools: StockPilotTools) -> None:
     @server.tool(
         name="get_listing",
         description=(
@@ -96,6 +102,39 @@ def build_mcp_server(tools: StockPilotTools | None = None) -> MCPServer:
         )
         return await asyncio.to_thread(tools.publish_listing, request)
 
+
+def build_inventory_server(tools: StockPilotTools | None = None) -> MCPServer:
+    tools = tools or StockPilotTools()
+    server = _new_server("stock-pilot-inventory", READ_ONLY_INSTRUCTIONS)
+    register_inventory_tools(server, tools)
+    return server
+
+
+def build_mall_server(tools: StockPilotTools | None = None) -> MCPServer:
+    tools = tools or StockPilotTools()
+    server = _new_server(
+        "stock-pilot-mall",
+        (
+            "Listing lookup and two-phase repricing. Reads are safe; the two "
+            "write tools only ever act through the approval queue."
+        ),
+    )
+    register_mall_tools(server, tools)
+    return server
+
+
+def build_mcp_server(tools: StockPilotTools | None = None) -> MCPServer:
+    tools = tools or StockPilotTools()
+    server = _new_server(
+        "stock-pilot",
+        (
+            "Inventory-driven repricing. Reads are safe; update_price and "
+            "publish_listing only ever act through the approval queue. Never "
+            "guess when get_listing returns ambiguous."
+        ),
+    )
+    register_inventory_tools(server, tools)
+    register_mall_tools(server, tools)
     return server
 
 

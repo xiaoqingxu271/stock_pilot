@@ -15,6 +15,7 @@ import sys
 import threading
 import traceback
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextlib import asynccontextmanager
 from typing import Any, Protocol, TypeVar, cast, runtime_checkable
 
 from mcp import ClientSession, StdioServerParameters
@@ -68,7 +69,9 @@ class ToolClient(Protocol):
     # Human approval plane (not MCP tools).
     def get_approval(self, approval_id: str) -> ApprovalView | None: ...
 
-    def abandon_approval(self, approval_id: str, reason: str) -> ApprovalView: ...
+    def abandon_approval(
+        self, approval_id: str, reason: str, abandoned_by: str | None = None
+    ) -> ApprovalView: ...
 
     def decide_approval(
         self,
@@ -87,12 +90,52 @@ def create_tool_client(
         return StockPilotTools(settings)
     if selected == "mcp":
         return MCPToolClient(settings)
+    if selected == "mcp-http":
+        headers = (
+            {"Authorization": f"Bearer {settings.agent_token}"}
+            if settings.agent_token
+            else None
+        )
+        return SplitMCPToolClient(
+            settings,
+            inventory_url=settings.inventory_mcp_url,
+            mall_url=settings.mall_mcp_url,
+            headers=headers,
+        )
     raise ValueError(
-        f"unknown STOCK_PILOT_TOOL_CLIENT={selected!r}; expected 'inprocess' or 'mcp'"
+        f"unknown STOCK_PILOT_TOOL_CLIENT={selected!r};"
+        " expected 'inprocess', 'mcp', or 'mcp-http'"
     )
 
 
-class MCPToolClient:
+class _LocalApprovalPlane:
+    """The approval queue is a human admin plane, not an MCP tool set."""
+
+    settings: Settings
+
+    def get_approval(self, approval_id: str) -> ApprovalView | None:
+        return approval_queue.get_approval(self.settings.db_path, approval_id)
+
+    def abandon_approval(
+        self, approval_id: str, reason: str, abandoned_by: str | None = None
+    ) -> ApprovalView:
+        return approval_queue.abandon_approval(
+            self.settings.db_path, approval_id, reason, abandoned_by
+        )
+
+    def decide_approval(
+        self,
+        approval_id: str,
+        decision: ApprovalDecision,
+        note: str | None = None,
+        decided_by: str | None = None,
+    ) -> ApprovalView:
+        return approval_queue.decide_approval(
+            self.settings.db_path, approval_id, decision, note, decided_by
+        )
+
+
+class MCPToolClient(_LocalApprovalPlane):
     """Synchronous facade over a long-lived MCP stdio client session."""
 
     def __init__(
@@ -103,6 +146,8 @@ class MCPToolClient:
         args: list[str] | None = None,
         env: dict[str, str] | None = None,
         connect_timeout: float = 15.0,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.settings = settings
         # The orchestrator owns the task/approval DB even when tool calls go
@@ -125,12 +170,16 @@ class MCPToolClient:
         self._error: BaseException | None = None
         self._closed = False
 
-        self._params = StdioServerParameters(
-            command=command or sys.executable,
-            args=args if args is not None else ["-m", "stock_pilot.mcp_server"],
-            env=self._server_env(env),
-            cwd=str(PROJECT_ROOT),
-        )
+        self._url = url
+        self._headers = dict(headers or {})
+        self._params: StdioServerParameters | None = None
+        if url is None:
+            self._params = StdioServerParameters(
+                command=command or sys.executable,
+                args=args if args is not None else ["-m", "stock_pilot.mcp_server"],
+                env=self._server_env(env),
+                cwd=str(PROJECT_ROOT),
+            )
         self._task = asyncio.run_coroutine_threadsafe(self._main(), self._loop)
         if not self._ready.wait(connect_timeout):
             self._error = TimeoutError(
@@ -152,9 +201,28 @@ class MCPToolClient:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
+    @asynccontextmanager
+    async def _transport(self):
+        if self._url is not None:
+            from mcp.client.streamable_http import (
+                create_mcp_http_client,
+                streamable_http_client,
+            )
+
+            http_client = create_mcp_http_client(headers=self._headers or None)
+            async with http_client:
+                async with streamable_http_client(
+                    self._url, http_client=http_client
+                ) as (read, write):
+                    yield read, write
+            return
+        assert self._params is not None
+        async with stdio_client(self._params) as (read, write):
+            yield read, write
+
     async def _main(self) -> None:
         try:
-            async with stdio_client(self._params) as (read, write):
+            async with self._transport() as (read, write):
                 async with ClientSession(
                     read,
                     write,
@@ -349,23 +417,49 @@ class MCPToolClient:
                 ) from exc
         return list(result.tools)
 
-    # -- human approval plane (local) ------------------------------------
 
-    def get_approval(self, approval_id: str) -> ApprovalView | None:
-        return approval_queue.get_approval(self.settings.db_path, approval_id)
+class SplitMCPToolClient(_LocalApprovalPlane):
+    """Routes each contracted tool to one of two independent HTTP servers."""
 
-    def abandon_approval(self, approval_id: str, reason: str) -> ApprovalView:
-        return approval_queue.abandon_approval(
-            self.settings.db_path, approval_id, reason
-        )
-
-    def decide_approval(
+    def __init__(
         self,
-        approval_id: str,
-        decision: ApprovalDecision,
-        note: str | None = None,
-        decided_by: str | None = None,
-    ) -> ApprovalView:
-        return approval_queue.decide_approval(
-            self.settings.db_path, approval_id, decision, note, decided_by
+        settings: Settings,
+        *,
+        inventory_url: str,
+        mall_url: str,
+        headers: dict[str, str] | None = None,
+        connect_timeout: float = 15.0,
+    ) -> None:
+        initialize_database(settings.db_path)
+        self.settings = settings
+        self._inventory = MCPToolClient(
+            settings,
+            url=inventory_url,
+            headers=headers,
+            connect_timeout=connect_timeout,
         )
+        self._mall = MCPToolClient(
+            settings,
+            url=mall_url,
+            headers=headers,
+            connect_timeout=connect_timeout,
+        )
+
+    def check_inventory(self, request: CheckInventoryInput) -> CheckInventoryOutput:
+        return self._inventory.check_inventory(request)
+
+    def get_listing(self, request: GetListingInput) -> GetListingOutput:
+        return self._mall.get_listing(request)
+
+    def update_price(self, request: UpdatePriceInput) -> UpdatePriceOutput:
+        return self._mall.update_price(request)
+
+    def publish_listing(self, request: PublishListingInput) -> PublishListingOutput:
+        return self._mall.publish_listing(request)
+
+    def is_available(self) -> bool:
+        return self._inventory.is_available() and self._mall.is_available()
+
+    def close(self) -> None:
+        self._inventory.close()
+        self._mall.close()
