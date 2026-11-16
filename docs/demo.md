@@ -105,6 +105,18 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http STOCK_PILOT_ADMIN_TOKEN=demo-admin-token \
 `reservation_stale`，不会抢走库存。静态 Token 只是演示级身份，生产应换 OIDC
 并强制审批人与提交人分离。
 
+### 预留清理（可选，30 秒）
+
+`--split` 运行时，模拟「预留后进程崩溃」留下的孤立预留：
+
+```bash
+./.venv/Scripts/python.exe -c "import datetime,sqlite3; c=sqlite3.connect('data/inventory.db'); c.execute(\"UPDATE inventory_records SET reserved_by='apr-ghost', reserved_at=? WHERE id='INV-001'\",(datetime.datetime.now(datetime.timezone.utc).isoformat(),)); c.commit()"
+```
+
+刷新页面：恢复面板出现「遗留库存预留」，点「释放遗留预留」（或
+`POST /reservations/gc`）。说明清理只按审批/任务状态判断，不看 TTL；如果审批仍可
+发布，即使预留超龄也只标记 `reservation_stale`。
+
 ## 5. 收尾（30 秒）
 
 `GET /healthz` 返回数据库与工具客户端就绪状态（不可用时 503），部署层据此

@@ -1,0 +1,111 @@
+# 面试讲解笔记
+
+目标：用 3 分钟讲清「这不是一个让模型自由发挥的 Agent，而是一个把失败语义写进状态的受约束执行器」，并准备好被追问的边界。
+
+## 一句话定位
+
+StockPilot 把「库存检查 → 商品映射 → 调价提案 → 人工审批 → 发布前复核 → 原子提交 → 最终核对」做成一条可审计、可恢复、失败即停的跨系统任务链；模型没有直接改价或上架的工具。
+
+## 3 分钟叙述
+
+1. **问题**：库存驱动调价跨三个系统（库存、商城、审批）。真正的风险不是「模型不会调价」，而是库存过期、同名商品、写超时、进程崩溃之后的脏状态。
+2. **链路**：`check_inventory`（只读）→ `get_listing`（三态映射）→ `update_price`（只写 staging + 审批）→ 人工审批 → `check_inventory` 复核 → （split 下内部预留）→ `publish_listing`（原子提交并消费审批）→ `get_listing` 核对。
+3. **硬约束**：
+   - 库存 ≤ 0 在写之前终止，零写入；
+   - 映射歧义挂起并给候选，禁止猜；
+   - 只有 `publish_listing` 在审批通过后改商城；
+   - 写超时只做一次只读对账，之后「状态未知、任务中止」；
+   - 拒绝 / 复核失败都丢弃 staging，不留「价格改了但没上架」。
+4. **两阶段提交**：`update_price` 在同一事务写 `staging` + `approvals`，商城不可见；`publish_listing` 在同一事务完成改价、上架、消费审批、提交 staging。审批拒绝时只丢 staging，商城从未写。
+5. **三库与 saga（可选讲）**：split 下库存、商城（含审批）、编排各一个 SQLite。商城看不到库存表，所以发布链路变成「复核 → 内部 `reserve_inventory` → 商城事务提交 → 回写任务 → 尽力释放」。商城提交后响应丢失时，只读 `get_listing` 采纳已提交事实，绝不重发写。
+6. **恢复与观测**：审批状态以数据库为准，进程重启后从 checkpoint 继续；`GET /recovery` 只读标注异常态；指标从 SQLite 权威状态派生，JSON 日志只输出白名单字段。
+
+收尾一句：**系统的正确性来自「不确定时停止写入」和「每个写事实只有一个持久化点」，而不是来自重试。**
+
+## 设计决策速查
+
+| 问题 | 选择 | 原因 |
+|---|---|---|
+| 审批放哪个库 | 与商城同库（`mall.db`） | `update_price` 必须原子写 staging + approval；审批授权的是商城写，提交时在同一事务消费审批 |
+| 写失败怎么办 | 写只执行一次；超时只对账一次 | 重试可能重复提交；人工或恢复路径处理剩余状态 |
+| 拒绝如何回滚 | 丢弃 staging；商城未写过 | 没有中间脏状态的来源 |
+| 跨库如何保证库存 | split 下内部预留 | 无法跨库事务；预留覆盖复核到提交的窗口 |
+| 预留过期怎么办 | TTL 只报警，清理按审批/任务状态 | 活跃审批的预留可能正要提交，按时间强制释放会造成超卖 |
+| 要不要 outbox 重投写 | 不要 | 会违反「不确定后停止写」；outbox 只能用于通知类副作用 |
+| 幂等 | `Idempotency-Key` 唯一索引 + 审批消费原子性 + 预留按 approval 幂等 | 重复请求不重复建任务/不重复提交 |
+
+## 10 个高频追问
+
+### 1. 为什么审批记录和 staging 放在商城库，而不是编排库？
+
+因为 `update_price` 的核心不变量是「staging + approval 同一事务」，而 `publish_listing` 要在同一事务里「改价 + 上架 + 消费审批」。审批是商城写的授权凭证，放在商城库才能让授权与提交原子。人机管理面仍在编排进程（审批 API 只是打开 mall 库），但它不是模型可调用的 MCP 工具。
+
+### 2. 为什么刻意不用 outbox 重投 `publish_listing`？
+
+写操作的响应丢失不等于写失败。如果 outbox 重投，可能出现「第一次已提交、第二次被拒绝」甚至重复副作用。这里的做法是：写只发一次；不确定时用只读 `get_listing` 对账，商城已按目标价上架就采纳事实，未提交就进入 `ABORTED_UNKNOWN_STATE`。通知、审计导出将来可以用 outbox，但**绝不能重投写工具**。
+
+### 3. 预留为什么不按 TTL 自动释放？
+
+预留保护的是「复核通过到商城提交」这段窗口。一个审批已通过、任务仍在等待恢复的预留，可能几小时后才提交；按时间强制释放会让另一个任务抢走同一件库存。所以 TTL 只用于把超龄预留标成 `reservation_stale` 报警；清理只释放审批已 `consumed` / `rejected` / `abandoned`、审批缺失或任务已终态的预留。
+
+### 4. 写超时后为什么只对账一次？
+
+重试写是不安全的。`get_listing` 的 `pending` 字段能看到 staging/审批是否已经落库：改价超时就采纳已落库的 `approval_id`；上架超时就确认价格与状态是否已是目标值。对账失败就中止为「状态未知」，把现场留给恢复面板和人工，而不是继续尝试。
+
+### 5. 幂等是怎么做实的？
+
+- `POST /tasks`：`Idempotency-Key` 唯一索引；并发相同键只有一个任务，重放返回原任务；不同请求体返回 `IDEMPOTENCY_CONFLICT`。
+- 审批：重复提交同一决策返回当前任务；相反决策返回 `APPROVAL_ALREADY_DECIDED`。
+- 发布：审批消费在提交事务内，第二次调用得到 `APPROVAL_ALREADY_CONSUMED`，不会二次提交。
+- 预留：同一 `approval_id` 重复预留是幂等的；释放幂等。
+
+### 6. 如何保证不出现「价格已改但未上架」？
+
+`update_price` 只写 staging 和审批，商城公开价格不变。只有审批通过后的 `publish_listing` 才在同一事务里改价、上架、消费审批、提交 staging。拒绝或复核失败时丢弃 staging。split 模式下商城提交是唯一持久化点，补偿只释放预留或撤回未提交提案。
+
+### 7. 已经有发布前复核，为什么还要提交时兜底（或预留）？
+
+审批可能持续数小时，复核读数也会过期。单库模式下 `publish_listing` 在提交事务内再查一次库存，不足则整个事务回滚；split 模式下商城看不到库存库，所以由内部预留承担同一职责（`check_stock=False`）。
+
+### 8. 映射歧义为什么挂起而不是自动选第一个？
+
+同名商品可能规格不同、对应不同库存记录。选错就是给错误的商品改价。`get_listing` 返回 `resolved / ambiguous / not_found`，歧义时 LangGraph `interrupt` 挂起，人工从候选里选，且候选规格必须与任务规格、库存记录一致，否则终止。系统不猜。
+
+### 9. 角色分离和 admin 自审怎么处理？
+
+静态 Bearer Token 映射 agent / operator / admin：提交任务需要 agent，审批、映射、恢复、撤回需要 operator。配置 Token 后，`submitted_by` / `decided_by` / `abandoned_by` 来自 Token 身份，请求体不能伪装。正常流程 agent ≠ operator；admin 是 break-glass，可自审，但会写 warning 日志，审计里 `submitted_by == decided_by` 一眼可见。
+
+### 10. 重启后怎么恢复？恢复会不会重复写？
+
+审批状态以数据库为准，图从 checkpoint 继续。`GET /recovery` 只读分类：已审批未提交、已拒绝未关闭、系统撤回未关闭、已提交待核对、遗留 staging、遗留预留等。`POST /tasks/{id}/recover` 只做三类事：继续已审批的发布、回写拒绝/撤回的终态、对已提交任务补一次只读核对；恢复不会新增写决策，也绝不重复调用已成功的 `publish_listing`。
+
+## 失败矩阵速查
+
+| 触发 | 任务终态 | 写操作 |
+|---|---|---|
+| 初始库存 ≤ 0 | `ABORTED_NO_STOCK` | 零写 |
+| 映射歧义 | `SUSPENDED_AMBIGUOUS` | 零写，等人工 |
+| 审批拒绝 | `ROLLED_BACK` | staging 丢弃，商城未写 |
+| 发布前复核库存 ≤ 0 | `ROLLED_BACK` / `INSUFFICIENT_STOCK` | 审批 `abandoned`，staging 丢弃，商城未写 |
+| 预留失败 | `ROLLED_BACK` / `ABORTED_NOT_FOUND` / `ABORTED_UNKNOWN_STATE` | 撤回提案，不提交商城 |
+| 提交事务内库存不足 | `ROLLED_BACK` | 事务整体回滚，商城零写 |
+| 写超时/不可用 | 一次只读对账；失败则 `ABORTED_UNKNOWN_STATE` | 绝不重发写 |
+| 商城已提交但响应丢失 | 采纳并核对，或 `ABORTED_UNKNOWN_STATE` | 不二次发布 |
+| 预留后崩溃 | 恢复面板报 `reservation_orphaned` | 保守清理只释放不可再发布的预留 |
+
+## 现场演示顺序（8 分钟）
+
+1. `stock_pilot.demo` 启动，指出审批台、三个演示 SKU 与安全承诺。
+2. Happy path：提交 59 元 → 审批前商城仍是 79 → 通过 → 核对一致。
+3. 三条失败路径：库存不足、映射歧义、审批拒绝（可加审批期间库存归零）。
+4. 恢复与幂等：重启后继续审批；同 `Idempotency-Key` 只建一个任务。
+5. `--split` 与鉴权：三库、两个 HTTP MCP Server、角色 401/403、预留清理。
+6. 收尾：`/healthz`、`/metrics`、`/recovery` 三块运维面。
+
+## 已知边界（主动说明，不回避）
+
+- 预留清理由 operator 或外部调度触发，没有进程内定时任务；
+- 没有会重投写的 outbox（这是设计选择）；通知类 outbox 尚未实现；
+- 存储是 SQLite，WAL + `BEGIN IMMEDIATE` 适合演示与单机，不是分布式数据库；
+- 静态 Token 是演示级身份，生产应换 OIDC，并接入统一网关与审计平台；
+- 指标和 JSON 日志已落地，但尚未接入告警平台 / 日志聚合。

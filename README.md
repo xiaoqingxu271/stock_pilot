@@ -19,6 +19,15 @@ check_inventory → get_listing → update_price（审批）
 一条命令启动 API、种入演示数据并打印三个用例（正常调价 / 库存不足 / 映射歧义）。
 加 `--split` 会同时拉起库存与商城两个 HTTP MCP Server；`--fresh` 只重建演示库。
 
+跑起来后可快速验证运行时状态：
+
+```bash
+curl -s localhost:8000/healthz
+curl -s localhost:8000/metrics | grep reservations
+curl -s localhost:8000/reservations          # 只读列出存活预留
+curl -s -X POST localhost:8000/reservations/gc   # operator 清理（无 Token 时本地开放）
+```
+
 ![StockPilot 审批台](docs/screenshots/console.png)
 
 页面左侧是审批队列、映射确认与执行链路；右侧提交任务并查看任务流水。截图对应：
@@ -38,6 +47,7 @@ check_inventory → get_listing → update_price（审批）
 | 写超时 | 只做一次只读 `get_listing` 对账；对账失败进入 `ABORTED_UNKNOWN_STATE`，绝不重发写操作 |
 | 商城已提交但响应丢失 | 只读对账发现已按目标价上架则采纳并核对，审批已消费；不会第二次调用 `publish_listing` |
 | 拆分存储下的提交期库存 | 复核后先预留库存，失败则撤回提案、商城零写入；提交后尽力释放预留 |
+| 预留后进程崩溃 | 恢复扫描报 `reservation_orphaned`；`POST /reservations/gc` 只释放审批已终止/缺失或任务终态的预留，活跃审批的预留不自动释放 |
 | 进程中断 | 重启后 `GET /recovery` 显式列出异常态；已审批提案可安全恢复，未审批任务沿用原流程 |
 | 重复请求 | `Idempotency-Key` 保证 `POST /tasks` 不重复建任务；重复审批返回当前结果 |
 | 操作人身份 | 配置 Token 后写接口按角色校验；`decided_by` / `abandoned_by` 取自身份，不信任请求体 |
@@ -236,6 +246,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 
 ## 文档
 
+- `docs/interview-notes.md`：3 分钟叙述、10 个高频追问、失败矩阵与已知边界。
 - `docs/demo.md`：约 8 分钟的面试演示脚本，含失败路径与拆分/鉴权演示。
 - `docs/screenshots/console.png`：审批台截图（演示数据：待审批 / 映射歧义 / 已核对 / 库存终止）。
 - `docs/observability.md`：指标、告警规则、结构化日志与断线重连语义。

@@ -218,7 +218,8 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 
 ## 文档
 
-- `docs/demo.md`：面试演示脚本（含失败路径、恢复、拆分与鉴权）。
+- `docs/interview-notes.md`：3 分钟项目叙述、10 个高频追问、失败矩阵、已知边界。
+- `docs/demo.md`：面试演示脚本（含失败路径、恢复、拆分、鉴权与预留清理）。
 - `docs/observability.md`：指标清单、Prometheus 告警规则示例、JSON 日志字段、断线重连语义。
 - `docs/screenshots/console.png`：审批台截图，README 首屏引用。
 - `docs/adr/`：0001 两阶段审批提交、0002 失败即停止写、0003 拆分与静态 Token、0004 恢复与人工清理、0005 三库分离与发布 saga、0006 预留 TTL 与清理。
