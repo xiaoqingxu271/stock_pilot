@@ -1,5 +1,7 @@
 # StockPilot
 
+[![CI](https://github.com/xiaoqingxu271/stock_pilot/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoqingxu271/stock_pilot/actions/workflows/ci.yml)
+
 基于 MCP 的库存驱动电商调价上架 Agent。调用方给定 `sku_id`、规格、目标价和理由，Agent 负责在受约束的链路中安全执行：
 
 ```
