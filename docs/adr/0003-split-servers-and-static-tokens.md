@@ -29,10 +29,16 @@ Static bearer tokens map to three roles:
   proposals.
 - `admin`: covers both.
 
-Any configured token turns enforcement on. `decided_by` and `abandoned_by`
-come from the token principal, never from the request body. Read-only
-endpoints stay open for the local console and must sit behind a gateway in
-production.
+Any configured token turns enforcement on. `submitted_by`, `decided_by`, and
+`abandoned_by` come from the token principal, never from the request body.
+Read-only endpoints stay open for the local console by default;
+`STOCK_PILOT_REQUIRE_READ_AUTH=true` requires a valid token for them too
+(`/healthz` stays open for probes). In production they should also sit behind
+a gateway.
+
+Role separation means an agent cannot approve what it submitted. Admin covers
+both roles as break-glass; self-approval is allowed there but emits a warning
+and is visible as `submitted_by == decided_by`.
 
 ## Consequences
 

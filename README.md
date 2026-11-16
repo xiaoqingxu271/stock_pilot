@@ -23,6 +23,8 @@ check_inventory → get_listing → update_price（审批）
 | 进程中断 | 重启后 `GET /recovery` 显式列出异常态；已审批提案可安全恢复，未审批任务沿用原流程 |
 | 重复请求 | `Idempotency-Key` 保证 `POST /tasks` 不重复建任务；重复审批返回当前结果 |
 | 操作人身份 | 配置 Token 后写接口按角色校验；`decided_by` / `abandoned_by` 取自身份，不信任请求体 |
+| 并发写 | `BEGIN IMMEDIATE` 单写事务 + 部分唯一索引：每个 listing 只有一个活跃提案；审批只消费一次 |
+| 审批人 ≠ 提交人 | agent 与 operator 角色分离；admin 为 break-glass，自审会在日志与 `submitted_by == decided_by` 中暴露 |
 
 ## 架构
 
@@ -64,7 +66,7 @@ check_inventory → get_listing → update_price（审批）
 - `STOCK_PILOT_TOOL_CLIENT=mcp-http`：库存与商城拆成两个独立 MCP Server（Streamable HTTP），客户端按工具路由到对应服务，携带 `STOCK_PILOT_AGENT_TOKEN`。
 - 审批队列读写与决策留在编排进程本地，因为审批台是人机管理面，不属于四个 MCP 工具。
 
-**鉴权（B1）**：`STOCK_PILOT_AGENT_TOKEN` / `STOCK_PILOT_OPERATOR_TOKEN` / `STOCK_PILOT_ADMIN_TOKEN` 配置静态 Bearer Token。任一 Token 存在即启用校验：提交任务需 agent（admin 亦可），审批、映射确认、恢复、撤回需 operator（admin 亦可）；带身份时 `decided_by` / `abandoned_by` 取自身份，忽略请求体伪装。只读接口为演示便利保持开放，生产应置于网关之后。两个 HTTP MCP Server 同样只接受 agent Token。审批台的「管理令牌」输入框会附带 Bearer 头（存于 sessionStorage，关闭标签页即失效），填入 admin Token 即可在启用鉴权时操作全流程。未配置任何 Token 时保持本地演示模式。
+**鉴权（B1）**：`STOCK_PILOT_AGENT_TOKEN` / `STOCK_PILOT_OPERATOR_TOKEN` / `STOCK_PILOT_ADMIN_TOKEN` 配置静态 Bearer Token。任一 Token 存在即启用校验：提交任务需 agent（admin 亦可），审批、映射确认、恢复、撤回需 operator（admin 亦可）；带身份时 `decided_by` / `abandoned_by` 取自身份，忽略请求体伪装。只读接口默认保持开放以便演示；设置 `STOCK_PILOT_REQUIRE_READ_AUTH=true` 后，`GET /tasks|/approvals|/recovery` 也要求任一有效 Token（`/healthz` 始终开放供探针使用）。两个 HTTP MCP Server 同样只接受 agent Token。审批台的「管理令牌」输入框会附带 Bearer 头（存于 sessionStorage，关闭标签页即失效），填入 admin Token 即可在启用鉴权时操作全流程。未配置任何 Token 时保持本地演示模式。
 
 **两阶段提交**：`update_price` 在同一事务里写 `staging` 和 `approvals`，商城不可见；审批通过后 `publish_listing` 在同一事务内完成「改价 + 上架 + 消费审批」。因此不存在「价格已改但未上架」的中间脏状态。
 
@@ -133,7 +135,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 
 审批决策是幂等的：重复提交相同决策返回当前任务；提交相反决策返回 `409`。
 
-配置了 Token 时：`POST /tasks` 需 agent（或 admin）；`POST /tasks/{id}/mapping`、`POST /tasks/{id}/recover`、`POST /approvals/{id}/decision`、`POST /approvals/{id}/abandon` 需 operator（或 admin）。缺少 / 错误 Token 返回 `401`，角色不足返回 `403`。
+配置了 Token 时：`POST /tasks` 需 agent（或 admin）；`POST /tasks/{id}/mapping`、`POST /tasks/{id}/recover`、`POST /approvals/{id}/decision`、`POST /approvals/{id}/abandon` 需 operator（或 admin）。缺少 / 错误 Token 返回 `401`，角色不足返回 `403`。`STOCK_PILOT_REQUIRE_READ_AUTH=true` 时只读接口也要求有效 Token。
 
 ## 失败语义
 
@@ -151,7 +153,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 76 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 82 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -163,7 +165,8 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_ui.py`：审批台静态资源、队列联表、恢复入口与遗留提案清理。
 - `tests/test_mcp_client.py`：真实 MCP stdio 全链路、API/MCP 模式、服务不可用或中途退出时安全终止。
 - `tests/test_mcp_http.py`：两个 Streamable HTTP MCP Server 的工具路由、完整图链路、Bearer 校验与未授权时安全终止。
-- `tests/test_auth.py`：角色鉴权、跨角色拒绝、身份覆盖请求体、撤回操作人留痕。
+- `tests/test_auth.py`：角色鉴权、跨角色拒绝、身份覆盖请求体、撤回操作人留痕、只读鉴权开关、admin 自审告警。
+- `tests/test_concurrency.py`：并发 staging 只产生一个提案、相反审批只有一个生效、并发发布只提交一次、相同 `Idempotency-Key` 并发提交只建一个任务。
 - `tests/test_recovery.py`：进程重启、幂等提交、审批幂等、操作者身份、工具时间线、恢复接口（含已提交任务只读核对）、发布前与事务内库存复核、遗留提案撤回。
 
 ## 目录
@@ -204,7 +207,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 
 1. 两个工具 Server 各自持有独立数据库与服务间鉴权；当前演示仍共享同一个 SQLite 文件。
 2. Postgres 替换 SQLite；跨服务提交从单库事务改为 saga / 补偿，明确每一步的一致性边界。
-3. 静态 Token 换成 OIDC / 真实登录，并强制审批人与提交人分离；只读接口纳入统一鉴权与网关。
+3. 静态 Token 换成 OIDC / 真实登录；只读鉴权已可通过 `STOCK_PILOT_REQUIRE_READ_AUTH` 开启，生产再接入统一网关。
 4. 结构化日志、指标、告警与审批审计导出。
 
-已知限制：共享 SQLite 适合单实例演示，拆分 Server 只是拓扑演练；只读接口未鉴权；静态 Token 没有轮换与细粒度权限。
+已知限制：共享 SQLite 适合单实例演示，拆分 Server 只是拓扑演练；静态 Token 没有轮换与细粒度权限；admin 自审只告警不阻断（正常流程由角色分离保证审批人 ≠ 提交人）。

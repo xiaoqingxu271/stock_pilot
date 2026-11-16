@@ -11,6 +11,7 @@ Safety properties encoded here:
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Any, TypedDict
 
@@ -41,6 +42,8 @@ from stock_pilot.models import (
     UpdatePriceInput,
     VerificationResult,
 )
+
+logger = logging.getLogger(__name__)
 
 TERMINAL = {
     TaskStatus.VERIFIED,
@@ -759,6 +762,13 @@ def decide_and_resume(
         )
 
     if approval.status is ApprovalStatus.PENDING:
+        if decided_by is not None and task.submitted_by == decided_by:
+            logger.warning(
+                "self-approval: %s decided %s on task %s they submitted",
+                decided_by,
+                decision.value,
+                task.task_id,
+            )
         client.decide_approval(approval_id, decision, note, decided_by)
     elif not _approval_matches_decision(approval, decision):
         raise ToolFailure(

@@ -49,7 +49,8 @@ check_inventory（只读）→ get_listing（只读）→ update_price（写，�
 8. **发布前库存复核**：审批通过后、`publish_listing` 前用现有 `check_inventory` 再读一次。库存 ≤ 0 → 不提交商城，审批置 `abandoned` 并在同一事务丢弃 staging，任务 `ROLLED_BACK` / `INSUFFICIENT_STOCK`。复核工具失败同样撤回提案，避免「任务已终止但 staging 仍活跃」。
 9. **重启恢复与幂等**：审批状态以数据库为准，进程重启后可从 checkpoint 继续；`GET /recovery` 只读标注异常态；`POST /tasks/{id}/recover` 对 `awaiting_approval` 任务继续图，对 `published` 任务只读补核对；`Idempotency-Key` 与重复审批返回原结果。
 10. **提交时兜底与人工清理**：`publish_listing` 在提交事务内再次校验库存（复核读数可能已过期），不足则整个事务回滚、零写入；写超时遗留的 `price_staged` 只由人工经 `POST /approvals/{id}/abandon` 清理，接口必须先只读对账，商城已提交则拒绝撤回。`GET /healthz` 暴露数据库与工具客户端就绪状态。
-11. **鉴权与拆分（B1）**：静态 Bearer Token 映射 agent / operator / admin 三角色；任一 Token 配置即强制校验，身份写入 `decided_by` / `abandoned_by`。库存与商城各一个 Streamable HTTP MCP Server，只接受 agent Token；审批面仍留在编排进程。只读接口保持开放仅用于本地演示，生产必须置于统一鉴权网关之后。
+11. **鉴权与拆分（B1）**：静态 Bearer Token 映射 agent / operator / admin 三角色；任一 Token 配置即强制校验，身份写入 `submitted_by` / `decided_by` / `abandoned_by`。库存与商城各一个 Streamable HTTP MCP Server，只接受 agent Token；审批面仍留在编排进程。只读接口默认开放，`STOCK_PILOT_REQUIRE_READ_AUTH=true` 时纳入鉴权。正常流程靠角色分离保证审批人 ≠ 提交人；admin 自审（break-glass）会写 warning 日志，`submitted_by == decided_by` 可在审计中识别。
+12. **并发不变量**：所有写路径使用 `BEGIN IMMEDIATE` 串行化；每个 listing 的活动 staging 由部分唯一索引兜底；审批消费与商城提交在同一事务。测试覆盖并发 staging / 相反审批 / 并发发布 / 相同幂等键提交，要求每次只有一个赢家。
 
 ## 验收用例（至少 5 条，每次改动后回归）
 
@@ -114,9 +115,9 @@ export STOCK_PILOT_OPERATOR_TOKEN=demo-operator-token
 STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 ```
 
-配置通过环境变量覆盖：`STOCK_PILOT_DB`、`STOCK_PILOT_TOOL_TIMEOUT`、`STOCK_PILOT_READ_RETRIES`、`STOCK_PILOT_CIRCUIT_THRESHOLD`、`STOCK_PILOT_CIRCUIT_COOLDOWN`、`STOCK_PILOT_TOOL_CLIENT`（`inprocess` 默认 / `mcp` / `mcp-http`）、`STOCK_PILOT_MCP_TRANSPORT`、`STOCK_PILOT_HOST`、`STOCK_PILOT_PORT`、`STOCK_PILOT_INVENTORY_URL`、`STOCK_PILOT_MALL_URL`、`STOCK_PILOT_AGENT_TOKEN`、`STOCK_PILOT_OPERATOR_TOKEN`、`STOCK_PILOT_ADMIN_TOKEN`、`STOCK_PILOT_INVENTORY_PORT`、`STOCK_PILOT_MALL_PORT`、`STOCK_PILOT_BIND_HOST`。
+配置通过环境变量覆盖：`STOCK_PILOT_DB`、`STOCK_PILOT_TOOL_TIMEOUT`、`STOCK_PILOT_READ_RETRIES`、`STOCK_PILOT_CIRCUIT_THRESHOLD`、`STOCK_PILOT_CIRCUIT_COOLDOWN`、`STOCK_PILOT_TOOL_CLIENT`（`inprocess` 默认 / `mcp` / `mcp-http`）、`STOCK_PILOT_MCP_TRANSPORT`、`STOCK_PILOT_HOST`、`STOCK_PILOT_PORT`、`STOCK_PILOT_INVENTORY_URL`、`STOCK_PILOT_MALL_URL`、`STOCK_PILOT_AGENT_TOKEN`、`STOCK_PILOT_OPERATOR_TOKEN`、`STOCK_PILOT_ADMIN_TOKEN`、`STOCK_PILOT_REQUIRE_READ_AUTH`、`STOCK_PILOT_INVENTORY_PORT`、`STOCK_PILOT_MALL_PORT`、`STOCK_PILOT_BIND_HOST`。
 
-鉴权：任一 Token 配置即启用校验；`POST /tasks` 需 agent，审批/映射/恢复/撤回需 operator，admin 覆盖两者；`decided_by` / `abandoned_by` 取自身份。审批台「管理令牌」输入框把 Token 放进 `Authorization` 头（sessionStorage 保存）；只读接口保持开放（演示用），生产置于网关后。未配置 Token 时是本地无鉴权演示模式。
+鉴权：任一 Token 配置即启用校验；`POST /tasks` 需 agent，审批/映射/恢复/撤回需 operator，admin 覆盖两者；`decided_by` / `abandoned_by` 取自身份。审批台「管理令牌」输入框把 Token 放进 `Authorization` 头（sessionStorage 保存，输入后自动刷新）；只读接口默认开放，`STOCK_PILOT_REQUIRE_READ_AUTH=true` 时要求任一有效 Token（`/healthz` 除外）。未配置 Token 时是本地无鉴权演示模式。
 
 ## 代码架构
 
@@ -156,7 +157,7 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 - 最终核对复用 `get_listing`，结果写入 `tasks.verification_json`；核对通过才进入 `VERIFIED`。
 - 歧义 SKU 在人工选定后仍会返回 ambiguous，因此候选 `ListingCandidate` 也带 `pending`，核对/对账通过已确认的 `listing_id` 在候选中定位，不靠猜。
 - `start_task` / `resume_task` 用 `audit.task_context()` 包裹 `graph.invoke`，为工具事件提供 `task_id`。
-- `decide_and_resume` 幂等：相同决策重复提交返回当前任务；「审批已决策但图未恢复」时直接 resume，这正是重启恢复路径。相反决策返回 `APPROVAL_ALREADY_DECIDED`。
+- `decide_and_resume` 幂等：相同决策重复提交返回当前任务；「审批已决策但图未恢复」时直接 resume，这正是重启恢复路径。相反决策返回 `APPROVAL_ALREADY_DECIDED`。记录首次决策时若 `decided_by == task.submitted_by`（仅 admin break-glass 可能）打 warning，自审不会静默。
 - `recheck_stock`：审批通过后、`publish_listing` 前再调一次只读 `check_inventory`。库存 ≤ 0 → `abandon_approval`（本地事务：审批置 `abandoned` + staging 置 `discarded`）→ 任务 `ROLLED_BACK` / `INSUFFICIENT_STOCK`。复核工具失败同样不发布并撤回提案，任务 `ABORTED_UNKNOWN_STATE`；绝不留下已终止任务 + 活跃 staging。
 - `publish` 的提交事务内还有最后一道库存校验（见 `mall.publish_listing`）：复核读数可能过期，事务内库存 ≤ 0 时整体回滚；`agent` 收到 `INSUFFICIENT_STOCK` 后同样 `_abandon_proposal` 并落 `ROLLED_BACK`。
 - `verify_published_task()`：已提交但未写回核对结果的恢复路径，只读 `get_listing` + 写 `verification_json`，绝不再次调用 `publish_listing`；调用时同样用 `audit.task_context()` 关联工具事件。
@@ -191,7 +192,8 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 - `tests/test_ui.py`：审批台静态资源、页面入口、审批队列联表数据与状态过滤。
 - `tests/test_mcp_client.py`：真实 MCP stdio 客户端——四个工具契约、完整工具链、图与 FastAPI 跑在 MCP 模式、服务不可用 / 中途退出时安全终止且零后续写。
 - `tests/test_mcp_http.py`：两个 Streamable HTTP MCP Server（进程内 uvicorn）——工具路由、完整图链路、Bearer 缺失/错误时 401、未授权客户端安全终止。
-- `tests/test_auth.py`：角色鉴权——缺失/错误 Token 401、跨角色 403、admin 覆盖、身份覆盖请求体、撤回留痕 `abandoned_by`。
+- `tests/test_auth.py`：角色鉴权——缺失/错误 Token 401、跨角色 403、admin 覆盖与自审告警、身份覆盖请求体、撤回留痕 `abandoned_by`、只读鉴权开关。
+- `tests/test_concurrency.py`：并发 staging 单赢家、相反审批只生效一个、并发发布只提交一次、相同 `Idempotency-Key` 并发提交只建一个任务。
 - `tests/test_recovery.py`：进程重启后续审批/映射、恢复扫描与恢复接口（含 `published` 只读补核对）、任务/审批幂等、操作者留痕、工具事件时间线、发布前库存复核与系统撤回、遗留提案人工撤回与拒绝条件。
 
 ## 文档
@@ -201,4 +203,4 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 
 ## 实现状态
 
-工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复（含已提交任务补核对）、任务/审批幂等、工具调用审计、发布前与提交事务内库存复核、遗留提案人工清理、健康检查均已落地；B1 已完成库存/商城两个 Streamable HTTP MCP Server 与静态 Token 角色鉴权；任务、审批、撤回分别留痕提交人 / 审批人 / 撤回人。`pytest -q` 当前 76 个用例通过，`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。尚未实现：各服务独立数据库与 saga 补偿、OIDC / 真实登录、只读接口鉴权、Postgres。
+工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复（含已提交任务补核对）、任务/审批幂等、工具调用审计、发布前与提交事务内库存复核、遗留提案人工清理、健康检查均已落地；B1 已完成库存/商城两个 Streamable HTTP MCP Server 与静态 Token 角色鉴权；任务、审批、撤回分别留痕提交人 / 审批人 / 撤回人。`pytest -q` 当前 82 个用例通过（含并发不变量；并发用例连续 20 次全绿），`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。尚未实现：各服务独立数据库与 saga 补偿、OIDC / 真实登录、指标与结构化日志、Postgres。

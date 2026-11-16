@@ -956,12 +956,17 @@
       }
     });
     // Keep the bearer token in sessionStorage: it dies with the tab.
+    let tokenTimer = null;
     refs.adminToken.addEventListener("input", () => {
       try {
         window.sessionStorage.setItem(tokenKey, refs.adminToken.value.trim());
       } catch {
         // Ignore storage failures.
       }
+      // When read auth is on, loading the page before entering a token gets
+      // 401s; retry shortly after the operator types one.
+      window.clearTimeout(tokenTimer);
+      tokenTimer = window.setTimeout(() => refresh({ force: true }), 400);
     });
   }
 

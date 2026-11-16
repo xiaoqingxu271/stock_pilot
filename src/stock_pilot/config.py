@@ -29,6 +29,9 @@ class Settings:
     agent_token: str | None = None
     operator_token: str | None = None
     admin_token: str | None = None
+    # Read endpoints are open for the local console by default. Turn this on
+    # for production-like deployments that require a token even to read.
+    require_read_auth: bool = False
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -51,4 +54,8 @@ class Settings:
             agent_token=os.environ.get("STOCK_PILOT_AGENT_TOKEN") or None,
             operator_token=os.environ.get("STOCK_PILOT_OPERATOR_TOKEN") or None,
             admin_token=os.environ.get("STOCK_PILOT_ADMIN_TOKEN") or None,
+            require_read_auth=os.environ.get(
+                "STOCK_PILOT_REQUIRE_READ_AUTH", ""
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
         )

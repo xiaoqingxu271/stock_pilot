@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import sqlite3
 
 import pytest
@@ -92,7 +93,8 @@ def test_operator_identity_overrides_the_request_body(secured):
     assert record["decided_by"] == "operator"
 
 
-def test_admin_token_covers_agent_and_operator_actions(secured):
+def test_admin_token_covers_agent_and_operator_actions(secured, caplog):
+    caplog.set_level(logging.WARNING, logger="stock_pilot.agent")
     task = create_task(secured, ADMIN)
     assert task["submitted_by"] == "admin"
     decided = secured.post(
@@ -102,6 +104,33 @@ def test_admin_token_covers_agent_and_operator_actions(secured):
     )
     assert decided.status_code == 200
     assert decided.json()["status"] == "verified"
+
+    # Admin is the break-glass role; self-approval is allowed but must show up
+    # in the audit log and in submitted_by == decided_by.
+    assert any("self-approval" in record.getMessage() for record in caplog.records)
+    assert (
+        secured.get(f"/approvals/{task['approval_id']}", headers=AGENT).json()[
+            "decided_by"
+        ]
+        == "admin"
+    )
+
+
+def test_read_auth_can_be_required(settings: Settings):
+    locked = dataclasses.replace(
+        settings,
+        agent_token="agent-token",
+        operator_token="operator-token",
+        admin_token="admin-token",
+        require_read_auth=True,
+    )
+    with TestClient(create_app(locked)) as client:
+        for path in ("/tasks", "/recovery", "/approvals", "/approvals/queue"):
+            assert client.get(path).status_code == 401, path
+            assert client.get(path, headers=AGENT).status_code == 200, path
+
+        # Health checks stay unauthenticated for the orchestrator/probes.
+        assert client.get("/healthz").status_code == 200
 
 
 def test_abandon_requires_operator_and_records_identity(secured):

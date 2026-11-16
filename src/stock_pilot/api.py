@@ -125,11 +125,13 @@ def create_app(
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-    def _require(role: Role):
-        """Enforce the role for a mutating endpoint.
+    def _require(role: Role | None):
+        """Enforce a role, or merely authentication when ``role`` is None.
 
         No configured tokens means local demo mode (returns ``None``). As soon
-        as any token exists, every mutation requires an appropriate token.
+        as any token exists, every mutation requires an appropriate token;
+        read endpoints additionally require one only when
+        ``STOCK_PILOT_REQUIRE_READ_AUTH`` is on.
         """
 
         def dependency(
@@ -139,13 +141,15 @@ def create_app(
         ) -> Principal | None:
             principal = auth.principal_from_authorization(settings, authorization)
             if principal is not None:
-                if not auth.permits(principal, role):
+                if role is not None and not auth.permits(principal, role):
                     raise HTTPException(
                         status_code=403,
                         detail=f"role {role.value!r} required",
                     )
                 return principal
             if not auth.auth_enabled(settings):
+                return None
+            if role is None and not settings.require_read_auth:
                 return None
             raise HTTPException(
                 status_code=401,
@@ -213,25 +217,36 @@ def create_app(
             return _replay_existing(existing, request)
 
     @app.get("/tasks", response_model=list[TaskView])
-    def list_task_records(limit: int = Query(default=100, ge=1, le=500)):
+    def list_task_records(
+        _principal: Principal | None = Depends(_require(None)),
+        limit: int = Query(default=100, ge=1, le=500),
+    ):
         return tasks.list_tasks(db_path, limit=limit)
 
     @app.get("/tasks/{task_id}", response_model=TaskView)
-    def get_task_record(task_id: str) -> TaskView:
+    def get_task_record(
+        task_id: str,
+        _principal: Principal | None = Depends(_require(None)),
+    ) -> TaskView:
         task = tasks.get_task(db_path, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         return task
 
     @app.get("/tasks/{task_id}/events", response_model=list[ToolEvent])
-    def get_task_events(task_id: str) -> list[ToolEvent]:
+    def get_task_events(
+        task_id: str,
+        _principal: Principal | None = Depends(_require(None)),
+    ) -> list[ToolEvent]:
         task = tasks.get_task(db_path, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         return audit.list_tool_events(db_path, task_id)
 
     @app.get("/recovery", response_model=list[RecoveryIssue])
-    def list_recovery_issues() -> list[RecoveryIssue]:
+    def list_recovery_issues(
+        _principal: Principal | None = Depends(_require(None)),
+    ) -> list[RecoveryIssue]:
         return recovery.scan(db_path)
 
     @app.get("/healthz", response_model=HealthStatus)
@@ -433,6 +448,7 @@ def create_app(
     @app.get("/approvals", response_model=list[ApprovalView])
     def list_approval_queue(
         status: ApprovalStatus | None = Query(default=None),
+        _principal: Principal | None = Depends(_require(None)),
     ) -> list[ApprovalView]:
         return approval.list_approvals(db_path, status)
 
@@ -440,11 +456,15 @@ def create_app(
     def approval_queue(
         status: ApprovalStatus = Query(default=ApprovalStatus.PENDING),
         limit: int = Query(default=100, ge=1, le=500),
+        _principal: Principal | None = Depends(_require(None)),
     ) -> list[ApprovalQueueItem]:
         return approval.list_queue(db_path, status=status, limit=limit)
 
     @app.get("/approvals/{approval_id}", response_model=ApprovalView)
-    def get_approval_record(approval_id: str) -> ApprovalView:
+    def get_approval_record(
+        approval_id: str,
+        _principal: Principal | None = Depends(_require(None)),
+    ) -> ApprovalView:
         record = approval.get_approval(db_path, approval_id)
         if record is None:
             raise HTTPException(status_code=404, detail="approval not found")
