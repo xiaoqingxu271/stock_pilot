@@ -9,6 +9,22 @@ check_inventory → get_listing → update_price（审批）
 
 这不是「让模型自己定价」的 Demo，而是一个把**审批门禁、两阶段提交、超时熔断、映射歧义、重启恢复**都写进代码和测试的受约束执行器。
 
+## 30 秒看懂
+
+```bash
+./.venv/Scripts/python.exe -m stock_pilot.demo          # 初始化演示库并启动审批台
+# 浏览器打开 http://127.0.0.1:8000/
+```
+
+一条命令启动 API、种入演示数据并打印三个用例（正常调价 / 库存不足 / 映射歧义）。
+加 `--split` 会同时拉起库存与商城两个 HTTP MCP Server；`--fresh` 只重建演示库。
+
+![StockPilot 审批台](docs/screenshots/console.png)
+
+页面左侧是审批队列、映射确认与执行链路；右侧提交任务并查看任务流水。截图对应：
+一次已通过的调价（¥59）、一个等待审批的第二轮提案（¥65）、一个因同名商品挂起的
+映射任务，以及一个库存为零直接终止的任务。
+
 ## 安全保证
 
 | 规则 | 实现 |
@@ -86,9 +102,12 @@ Windows Git Bash：
 python -m venv .venv
 ./.venv/Scripts/python.exe -m pip install -e ".[dev]"
 
-# 默认进程内模式
+# 一条命令：建库 + 启动审批台（默认进程内模式）
+./.venv/Scripts/python.exe -m stock_pilot.demo
+# 浏览器打开 http://127.0.0.1:8000/；加 --split 使用两个 HTTP MCP Server
+
+# 只启动 API
 ./.venv/Scripts/python.exe -m stock_pilot.api
-# 浏览器打开 http://127.0.0.1:8000/
 
 # 真实 MCP stdio 模式
 STOCK_PILOT_TOOL_CLIENT=mcp ./.venv/Scripts/python.exe -m stock_pilot.api
@@ -159,7 +178,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 89 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 93 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -172,7 +191,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_mcp_client.py`：真实 MCP stdio 全链路、API/MCP 模式、服务不可用或中途退出时安全终止。
 - `tests/test_mcp_http.py`：两个 Streamable HTTP MCP Server 的工具路由、完整图链路、Bearer 校验与未授权时安全终止。
 - `tests/test_auth.py`：角色鉴权、跨角色拒绝、身份覆盖请求体、撤回操作人留痕、只读鉴权开关、admin 自审告警。
-- `tests/test_concurrency.py`：并发 staging 只产生一个提案、相反审批只有一个生效、并发发布只提交一次、相同 `Idempotency-Key` 并发提交只建一个任务。
+- `tests/test_concurrency.py`：并发 staging 只产生一个提案、相反审批只有一个生效、并发发布只提交一次、相同 `Idempotency-Key` 并发提交只建一个任务、并发初始化同一演示库只 seed 一次。
 - `tests/test_recovery.py`：进程重启、幂等提交、审批幂等、操作者身份、工具时间线、恢复接口（含已提交任务只读核对）、发布前与事务内库存复核、遗留提案撤回。
 - `tests/test_observability.py`：`/metrics` 数值（任务、工具事件、耗时、熔断、降级）、JSON 日志字段与 `task_id`、白名单（Token 不入日志）、`/healthz` 降级。
 - `tests/test_reconnect.py`：HTTP MCP Server 停机 → 任务安全中止 → 同端口重启 → 自动重连 → 新任务完成，审计中只有一次成功 `publish_listing`。
@@ -194,6 +213,7 @@ src/stock_pilot/
   logging_config.py JSON / 文本日志配置
   auth.py         静态 Bearer Token 与角色
   recovery.py     只读重启对账
+  demo.py         一条命令启动演示（可选拆分拓扑）
   agent.py        LangGraph 状态机
   api.py          FastAPI + 静态审批台
   mcp_server.py   MCP 工具注册（单 Server / 拆分 Server 共用）
@@ -207,6 +227,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 ## 文档
 
 - `docs/demo.md`：约 8 分钟的面试演示脚本，含失败路径与拆分/鉴权演示。
+- `docs/screenshots/console.png`：审批台截图（演示数据：待审批 / 映射歧义 / 已核对 / 库存终止）。
 - `docs/observability.md`：指标、告警规则、结构化日志与断线重连语义。
 - `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理的决策记录。
 

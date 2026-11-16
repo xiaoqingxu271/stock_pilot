@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,7 @@ from conftest import count_rows, fetch_one
 from stock_pilot import approval, mall
 from stock_pilot.api import create_app
 from stock_pilot.config import Settings
+from stock_pilot.db import initialize_database
 from stock_pilot.enums import (
     ApprovalDecision,
     ApprovalStatus,
@@ -60,6 +62,39 @@ def race(*fns):
     with ThreadPoolExecutor(max_workers=len(fns)) as pool:
         futures = [pool.submit(runner, fn) for fn in fns]
         return [future.result(timeout=30) for future in futures]
+
+
+def test_concurrent_initialization_seeds_once(tmp_path):
+    """Split servers and the orchestrator may all open a fresh demo DB."""
+    db_path = str(tmp_path / "concurrent-init.db")
+    barrier = threading.Barrier(8)
+    errors: list[BaseException] = []
+
+    def initialize() -> None:
+        barrier.wait(timeout=10)
+        try:
+            initialize_database(db_path)
+        except BaseException as exc:  # noqa: BLE001 - collected for assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=initialize) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert errors == []
+    conn = sqlite3.connect(db_path)
+    try:
+        inventory = conn.execute(
+            "SELECT COUNT(*) FROM inventory_records"
+        ).fetchone()[0]
+        listings = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+    finally:
+        conn.close()
+    assert inventory == 4
+    assert listings == 4
 
 
 def test_concurrent_staging_has_one_winner(settings: Settings):

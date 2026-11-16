@@ -10,6 +10,7 @@ transaction so they are atomic.
 from __future__ import annotations
 
 import sqlite3
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -111,7 +112,12 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA journal_mode = WAL")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        # WAL is persisted in the database header; another process may hold
+        # the lock while initializing. Locked here is harmless.
+        pass
     return conn
 
 
@@ -135,19 +141,48 @@ def initialize_database(db_path: str, *, seed: bool = True) -> None:
     if path.parent and not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = connect(db_path)
-    try:
-        conn.executescript(SCHEMA)
-        _migrate(conn)
-        count = conn.execute(
-            "SELECT COUNT(*) AS n FROM inventory_records"
-        ).fetchone()["n"]
-    finally:
-        conn.close()
+    _create_schema(db_path)
 
-    if seed and count == 0:
-        with transaction(db_path) as tx:
-            _seed_demo_data(tx)
+    if seed:
+        # Split deployments may initialize the same demo DB concurrently
+        # (two MCP servers plus the orchestrator). Re-check the row count
+        # inside the write transaction so only one process seeds.
+        attempts = 20
+        for attempt in range(attempts):
+            try:
+                with transaction(db_path) as tx:
+                    count = tx.execute(
+                        "SELECT COUNT(*) AS n FROM inventory_records"
+                    ).fetchone()["n"]
+                    if count == 0:
+                        _seed_demo_data(tx)
+                break
+            except sqlite3.OperationalError as exc:
+                if attempt + 1 == attempts or "lock" not in str(exc).lower():
+                    raise
+                time.sleep(min(0.05 * (attempt + 1), 0.5))
+
+
+def _create_schema(db_path: str) -> None:
+    """Create tables and run migrations, tolerating concurrent starters.
+
+    ``PRAGMA journal_mode=WAL`` and DDL can report "database is locked"
+    without honoring the busy timeout. Split deployments legitimately boot
+    several processes against the same fresh demo DB, so retry briefly.
+    """
+    attempts = 20
+    for attempt in range(attempts):
+        conn = connect(db_path)
+        try:
+            conn.executescript(SCHEMA)
+            _migrate(conn)
+            return
+        except sqlite3.OperationalError as exc:
+            if attempt + 1 == attempts or "lock" not in str(exc).lower():
+                raise
+            time.sleep(min(0.05 * (attempt + 1), 0.5))
+        finally:
+            conn.close()
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:

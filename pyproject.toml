@@ -29,6 +29,7 @@ dev = [
 [project.scripts]
 stock-pilot-mcp = "stock_pilot.mcp_server:main"
 stock-pilot-api = "stock_pilot.api:main"
+stock-pilot-demo = "stock_pilot.demo:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

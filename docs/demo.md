@@ -5,9 +5,10 @@
 ## 0. 启动（30 秒）
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 76 passed
+./.venv/Scripts/python.exe -m pytest -q               # 93 passed
 ./.venv/Scripts/python.exe -m ruff check src tests
-./.venv/Scripts/python.exe -m stock_pilot.api    # http://127.0.0.1:8000/
+./.venv/Scripts/python.exe -m stock_pilot.demo        # http://127.0.0.1:8000/
+# --split 同时拉起两个 HTTP MCP Server；--fresh 重建演示库
 ```
 
 先指出页面右上角「管理令牌」：未配置 Token 时留空即可；配置 Token 后它就是
