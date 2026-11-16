@@ -248,11 +248,13 @@
     const actions = h("div", "card-actions");
     const recover = h("button", "btn btn-primary btn-small", "恢复执行");
     recover.type = "button";
-    const recoverable = [
-      "approved_not_published",
-      "rejected_not_closed",
-      "published_verify_pending",
-    ].includes(issue.kind);
+    const recoverable =
+      issue.task_status === "awaiting_approval" &&
+      [
+        "approved_not_published",
+        "rejected_not_closed",
+        "published_verify_pending",
+      ].includes(issue.kind);
     recover.disabled = !recoverable;
     if (!recoverable) recover.title = "该状态需要人工核查，不能自动继续";
     actions.append(recover);
