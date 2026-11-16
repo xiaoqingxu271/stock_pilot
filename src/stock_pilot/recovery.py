@@ -41,10 +41,34 @@ def scan(db_path: str) -> list[RecoveryIssue]:
             " ORDER BY t.created_at",
             _WATCHED_STATUSES,
         ).fetchall()
+        orphan_rows = conn.execute(
+            "SELECT s.id AS staging_id, s.listing_id, s.approval_id,"
+            " s.status AS staging_status, a.status AS approval_status,"
+            " tk.id AS task_id, tk.sku_id, tk.spec, tk.status AS task_status,"
+            " tk.target_price_cents, l.status AS listing_status,"
+            " l.price_cents AS listing_price_cents"
+            " FROM staging s"
+            " JOIN approvals a ON a.id = s.approval_id"
+            " LEFT JOIN ("
+            "   SELECT approval_id, MIN(id) AS id FROM tasks"
+            "   WHERE approval_id IS NOT NULL GROUP BY approval_id"
+            " ) t ON t.approval_id = s.approval_id"
+            " LEFT JOIN tasks tk ON tk.id = t.id"
+            " LEFT JOIN listings l ON l.id = s.listing_id"
+            " WHERE s.status = ? AND a.status IN (?, ?)"
+            " ORDER BY s.created_at",
+            (
+                StagingStatus.PRICE_STAGED.value,
+                ApprovalStatus.APPROVED.value,
+                ApprovalStatus.ABANDONED.value,
+            ),
+        ).fetchall()
     finally:
         conn.close()
 
     issues: list[RecoveryIssue] = []
+    reported_tasks: set[str] = set()
+
     for row in rows:
         task_status = TaskStatus(row["task_status"])
         approval_status = (
@@ -61,6 +85,7 @@ def scan(db_path: str) -> list[RecoveryIssue]:
         if finding is None:
             continue
         kind, message = finding
+        reported_tasks.add(row["task_id"])
         issues.append(
             RecoveryIssue(
                 kind=kind,
@@ -86,6 +111,54 @@ def scan(db_path: str) -> list[RecoveryIssue]:
                 staging_status=staging_status,
             )
         )
+
+    # A write timeout can leave a live staging row behind a terminal task.
+    # Report it instead of silently keeping an approved proposal alive.
+    for row in orphan_rows:
+        if row["task_id"] is not None and row["task_id"] in reported_tasks:
+            continue
+        aborted = ApprovalStatus(row["approval_status"]) is ApprovalStatus.ABANDONED
+        issues.append(
+            RecoveryIssue(
+                kind=RecoveryKind.STAGING_ORPHANED,
+                message=(
+                    "审批已撤回但 staging 仍为 price_staged，需人工清理。"
+                    if aborted
+                    else (
+                        "审批已通过但 staging 未提交，所属任务已不在可自动恢复状态；"
+                        "需人工核查或重新提交。"
+                    )
+                ),
+                task_id=row["task_id"],
+                sku_id=row["sku_id"],
+                spec=row["spec"],
+                task_status=(
+                    TaskStatus(row["task_status"])
+                    if row["task_status"] is not None
+                    else None
+                ),
+                target_price=(
+                    from_cents(row["target_price_cents"])
+                    if row["target_price_cents"] is not None
+                    else None
+                ),
+                listing_id=row["listing_id"],
+                listing_status=(
+                    ListingStatus(row["listing_status"])
+                    if row["listing_status"] is not None
+                    else None
+                ),
+                listing_price=(
+                    from_cents(row["listing_price_cents"])
+                    if row["listing_price_cents"] is not None
+                    else None
+                ),
+                approval_id=row["approval_id"],
+                approval_status=ApprovalStatus(row["approval_status"]),
+                staging_status=StagingStatus(row["staging_status"]),
+            )
+        )
+
     return issues
 
 
@@ -130,6 +203,12 @@ def _classify(
         return (
             RecoveryKind.REJECTED_NOT_CLOSED,
             "审批已拒绝但任务尚未关闭；恢复只会回写 rolled_back，不触碰商城。",
+        )
+
+    if approval_status is ApprovalStatus.ABANDONED:
+        return (
+            RecoveryKind.ABANDONED_NOT_CLOSED,
+            "提案已因发布前库存复核被系统撤回；恢复只会回写 rolled_back，不触碰商城。",
         )
 
     return (

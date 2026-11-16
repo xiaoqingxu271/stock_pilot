@@ -132,6 +132,11 @@ class StockPilotTools:
             self.settings.db_path, approval_id, decision, note, decided_by
         )
 
+    def abandon_approval(self, approval_id, reason):
+        return approval.abandon_approval(
+            self.settings.db_path, approval_id, reason
+        )
+
     def get_approval(self, approval_id):
         return approval.get_approval(self.settings.db_path, approval_id)
 

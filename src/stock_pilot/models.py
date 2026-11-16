@@ -132,6 +132,8 @@ class ApprovalView(BaseModel):
     created_at: datetime
     decided_at: datetime | None = None
     consumed_at: datetime | None = None
+    abandoned_at: datetime | None = None
+    abandon_reason: str | None = None
 
 
 class ApprovalQueueItem(BaseModel):
@@ -152,6 +154,8 @@ class ApprovalQueueItem(BaseModel):
     decided_by: str | None = None
     created_at: datetime
     decided_at: datetime | None = None
+    abandoned_at: datetime | None = None
+    abandon_reason: str | None = None
 
 
 class VerificationResult(BaseModel):
@@ -264,11 +268,11 @@ class RecoveryIssue(BaseModel):
 
     kind: RecoveryKind
     message: str
-    task_id: str
-    sku_id: str
-    spec: str
-    task_status: TaskStatus
-    target_price: Money
+    task_id: str | None = None
+    sku_id: str | None = None
+    spec: str | None = None
+    task_status: TaskStatus | None = None
+    target_price: Money | None = None
     listing_id: str | None = None
     listing_status: ListingStatus | None = None
     listing_price: Money | None = None

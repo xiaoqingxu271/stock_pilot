@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 from conftest import count_rows, fetch_one
 
-from stock_pilot import approval
+from stock_pilot import approval, recovery
 from stock_pilot.agent import (
     build_graph,
     confirm_mapping_and_resume,
@@ -25,6 +25,7 @@ from stock_pilot.enums import (
 )
 from stock_pilot.errors import ToolFailure
 from stock_pilot.models import (
+    CheckInventoryOutput,
     CreateTaskRequest,
     PublishListingOutput,
     UpdatePriceOutput,
@@ -59,6 +60,20 @@ class UpdateTimeoutAfterCommit(_Proxy):
         real = self._inner.update_price(request)
         assert real.ok, real
         return UpdatePriceOutput.fail(ErrorCode.TOOL_TIMEOUT, "simulated timeout")
+
+
+class RecheckTimeout(_Proxy):
+    """First stock check (task start) succeeds; the publish-time one times out."""
+
+    def __init__(self, inner: StockPilotTools) -> None:
+        super().__init__(inner)
+        self.checks = 0
+
+    def check_inventory(self, request):
+        self.checks += 1
+        if self.checks == 1:
+            return self._inner.check_inventory(request)
+        return CheckInventoryOutput.fail(ErrorCode.TOOL_TIMEOUT, "simulated timeout")
 
 
 class PublishTimeout(_Proxy):
@@ -291,3 +306,41 @@ def test_publish_timeout_before_commit_aborts_without_retrying(
 
     staging = approval.get_staging_for_approval(settings.db_path, task.approval_id)
     assert staging.status is StagingStatus.PRICE_STAGED  # never committed
+
+    # The unknown-outcome write leaves a live staging row; the recovery scan
+    # must surface it even though the task itself is terminal.
+    issues = recovery.scan(settings.db_path)
+    assert len(issues) == 1
+    assert issues[0].kind.value == "staging_orphaned"
+
+
+def test_recheck_timeout_stops_before_publish(
+    tools, checkpointer, settings: Settings
+):
+    flaky = RecheckTimeout(tools)
+    graph = build_graph(flaky, checkpointer)
+
+    task = start_task(flaky, graph, request())
+    assert task.status is TaskStatus.AWAITING_APPROVAL
+
+    done = decide_and_resume(
+        flaky, graph, task.approval_id, ApprovalDecision.APPROVE
+    )
+    assert done.status is TaskStatus.ABORTED_UNKNOWN_STATE
+    assert done.error_code is ErrorCode.TOOL_TIMEOUT
+
+    row = fetch_one(
+        settings, "SELECT price_cents, status FROM listings WHERE id = 'LST-001'"
+    )
+    assert row["price_cents"] == 7900
+    assert row["status"] == "draft"
+
+    staging = approval.get_staging_for_approval(settings.db_path, task.approval_id)
+    assert staging.status is StagingStatus.DISCARDED
+
+    record = approval.get_approval(settings.db_path, task.approval_id)
+    assert record.status is ApprovalStatus.ABANDONED
+    assert "发布前库存复核失败" in record.abandon_reason
+
+    # Failure to verify stock withdraws the proposal; no dirty staging.
+    assert recovery.scan(settings.db_path) == []

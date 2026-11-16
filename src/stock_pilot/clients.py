@@ -65,6 +65,8 @@ class ToolClient(Protocol):
     # Human approval plane (not MCP tools).
     def get_approval(self, approval_id: str) -> ApprovalView | None: ...
 
+    def abandon_approval(self, approval_id: str, reason: str) -> ApprovalView: ...
+
     def decide_approval(
         self,
         approval_id: str,
@@ -345,6 +347,11 @@ class MCPToolClient:
 
     def get_approval(self, approval_id: str) -> ApprovalView | None:
         return approval_queue.get_approval(self.settings.db_path, approval_id)
+
+    def abandon_approval(self, approval_id: str, reason: str) -> ApprovalView:
+        return approval_queue.abandon_approval(
+            self.settings.db_path, approval_id, reason
+        )
 
     def decide_approval(
         self,

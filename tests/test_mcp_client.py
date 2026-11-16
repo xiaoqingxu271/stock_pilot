@@ -184,6 +184,7 @@ def test_api_runs_through_mcp_client(
             "check_inventory",
             "get_listing",
             "update_price",
+            "check_inventory",
             "publish_listing",
             "get_listing",
         ]
@@ -253,6 +254,12 @@ def test_mcp_server_lost_after_staging_stops_before_publish(
     assert row["price_cents"] == 7900
     assert row["status"] == "draft"
 
+    # The publish-time stock check cannot run, so the proposal is withdrawn
+    # locally; no approved staging row survives the failed task.
     staging = approval.get_staging_for_approval(settings.db_path, task.approval_id)
     assert staging is not None
-    assert staging.status is StagingStatus.PRICE_STAGED
+    assert staging.status is StagingStatus.DISCARDED
+
+    record = approval.get_approval(settings.db_path, task.approval_id)
+    assert record is not None
+    assert record.status is ApprovalStatus.ABANDONED

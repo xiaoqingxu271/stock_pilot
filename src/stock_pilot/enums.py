@@ -53,6 +53,9 @@ class ApprovalStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     CONSUMED = "consumed"
+    # The system withdrew an approved proposal before commit (for example the
+    # publish-time inventory recheck found no stock). Not a human rejection.
+    ABANDONED = "abandoned"
 
 
 class ApprovalAction(str, Enum):
@@ -82,9 +85,11 @@ class RecoveryKind(str, Enum):
 
     APPROVED_NOT_PUBLISHED = "approved_not_published"
     REJECTED_NOT_CLOSED = "rejected_not_closed"
+    ABANDONED_NOT_CLOSED = "abandoned_not_closed"
     PUBLISHED_VERIFY_PENDING = "published_verify_pending"
     APPROVAL_MISSING = "approval_missing"
     APPROVED_WITHOUT_STAGING = "approved_without_staging"
+    STAGING_ORPHANED = "staging_orphaned"
     INTERRUPTED_BEFORE_APPROVAL = "interrupted_before_approval"
 
 

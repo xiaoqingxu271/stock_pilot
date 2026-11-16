@@ -139,12 +139,19 @@
             <li>
               <span class="chain-step">05</span>
               <div class="chain-body">
+                <strong>发布前复核</strong>
+                <p>提交前再查一次库存；不足则系统撤回提案，商城不变。</p>
+              </div>
+            </li>
+            <li>
+              <span class="chain-step">06</span>
+              <div class="chain-body">
                 <strong>原子提交</strong>
                 <p>价格、上架状态与审批消费在同一事务内完成。</p>
               </div>
             </li>
             <li>
-              <span class="chain-step">06</span>
+              <span class="chain-step">07</span>
               <div class="chain-body">
                 <strong>最终核对</strong>
                 <p>只读回读价格与状态，结果写入任务记录。</p>
@@ -222,6 +229,7 @@
 
     <footer class="safety">
       <span>写操作必须审批</span>
+      <span>发布前复核库存</span>
       <span>写超时只读对账</span>
       <span>拒绝零残留</span>
       <span>映射歧义不猜测</span>

@@ -3,7 +3,8 @@
 基于 MCP 的库存驱动电商调价上架 Agent。调用方给定 `sku_id`、规格、目标价和理由，Agent 负责在受约束的链路中安全执行：
 
 ```
-check_inventory → get_listing → update_price（审批）→ publish_listing（审批）→ get_listing 核对
+check_inventory → get_listing → update_price（审批）
+→ check_inventory（发布前复核）→ publish_listing → get_listing 核对
 ```
 
 这不是「让模型自己定价」的 Demo，而是一个把**审批门禁、两阶段提交、超时熔断、映射歧义、重启恢复**都写进代码和测试的受约束执行器。
@@ -13,6 +14,7 @@ check_inventory → get_listing → update_price（审批）→ publish_listing�
 | 规则 | 实现 |
 |---|---|
 | 库存 ≤ 0 | 在 `check_stock` 终止，审批、staging、商城写入均为零 |
+| 审批期间库存归零 | 审批通过后、提交前再查一次库存；不足则系统撤回提案（`abandoned`），丢弃 staging，任务回滚 |
 | 商品映射歧义 | `get_listing` 返回候选列表，LangGraph `interrupt` 挂起，必须人工选定，禁止猜测 |
 | 写操作必须审批 | `update_price` 只写 staging + 审批记录；商城公开价格在审批通过前不变 |
 | 审批拒绝零残留 | 拒绝时丢弃 staging；商城侧从未发生写入 |
@@ -36,7 +38,7 @@ check_inventory → get_listing → update_price（审批）→ publish_listing�
                     ┌──────────────▼───────────────┐
                     │ LangGraph 状态机              │
                     │ check → map → stage → gate    │
-                    │      → publish → verify       │
+                    │   → recheck → publish → verify│
                     └──────────────┬───────────────┘
                                    │ ToolClient
                     ┌──────────────▼───────────────┐
@@ -60,6 +62,10 @@ check_inventory → get_listing → update_price（审批）→ publish_listing�
 - 审批队列读写与决策留在编排进程本地，因为审批台是人机管理面，不属于四个 MCP 工具。
 
 **两阶段提交**：`update_price` 在同一事务里写 `staging` 和 `approvals`，商城不可见；审批通过后 `publish_listing` 在同一事务内完成「改价 + 上架 + 消费审批」。因此不存在「价格已改但未上架」的中间脏状态。
+
+**发布前复核**：审批可能持续数小时，库存不是审批时的快照。图在 `await_approval` 与 `publish` 之间增加 `recheck_stock`：库存不足、记录消失或复核工具失败时，系统不提交，而是把审批标记为 `abandoned` 并在同一事务里丢弃 staging；任务进入 `ROLLED_BACK`（库存不足）或 `ABORTED_UNKNOWN_STATE`（无法确认）。`abandoned` 不是人工拒绝，审计上区分开。
+
+**重启恢复**：`GET /recovery` 只读扫描中断态任务（已审批未提交、已拒绝/系统撤回未关闭、已提交未核对），以及写超时后遗留的 `price_staged` 提案。可自动继续的任务由 `POST /tasks/{id}/recover` 从图 checkpoint 恢复；遗留提案只标注、不自动写，避免在状态未知时做第二次决定。
 
 ## 快速开始
 
@@ -88,8 +94,9 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 2. **库存不足**：提交 `SKU-HOODIE-003` / `黑色-L` → 任务 `aborted_no_stock`，审批队列为空，商城零写入。
 3. **映射歧义**：提交 `SKU-AMBIG-002` / `白色-M` → 任务挂起，显示两个候选 → 人工选 `LST-002` → 进入审批 → 通过 → 核对。
 4. **审批拒绝**：任意正常提案 → 拒绝并填写原因 → 任务 `rolled_back`，staging 丢弃，商城价格不变。
-5. **重启恢复**：提交提案后重启 API → 原任务仍在队列，审批后正常完成。模拟「已决策未恢复」后，页面出现「待恢复任务」面板，点击「恢复执行」完成后续步骤。
-6. **重复提交**：带相同 `Idempotency-Key` 连续提交两次，只产生一个任务和一条审批。
+5. **审批期间库存归零**：提交提案后把 `inventory_records.quantity` 改为 0，再审批通过 → 任务 `rolled_back` / `INSUFFICIENT_STOCK`，审批 `abandoned`，staging 丢弃，商城不变。
+6. **重启恢复**：提交提案后重启 API → 原任务仍在队列，审批后正常完成。模拟「已决策未恢复」后，页面出现「待恢复任务」面板，点击「恢复执行」完成后续步骤。
+7. **重复提交**：带相同 `Idempotency-Key` 连续提交两次，只产生一个任务和一条审批。
 
 ## API
 
@@ -113,7 +120,8 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 
 | 错误码 | 任务终态 | 后续写操作 |
 |---|---|---|
-| `INSUFFICIENT_STOCK` | `ABORTED_NO_STOCK` | 禁止 |
+| `INSUFFICIENT_STOCK`（任务开始时） | `ABORTED_NO_STOCK` | 禁止 |
+| `INSUFFICIENT_STOCK`（发布前复核） | `ROLLED_BACK` | 禁止，审批 `abandoned`，staging 已丢弃 |
 | `MAPPING_AMBIGUOUS` | `SUSPENDED_AMBIGUOUS` | 等待人工映射 |
 | `APPROVAL_REJECTED` | `ROLLED_BACK` | 禁止，staging 已丢弃 |
 | `TOOL_TIMEOUT` / `TOOL_UNAVAILABLE` / `CIRCUIT_OPEN`（写） | 一次只读对账；失败则 `ABORTED_UNKNOWN_STATE` | 禁止重发 |
@@ -123,7 +131,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 56 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 59 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -134,7 +142,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_api.py`：FastAPI 操作接口与错误码。
 - `tests/test_ui.py`：审批台静态资源、队列联表、恢复入口。
 - `tests/test_mcp_client.py`：真实 MCP stdio 全链路、API/MCP 模式、服务不可用或中途退出时安全终止。
-- `tests/test_recovery.py`：进程重启、幂等提交、审批幂等、操作者身份、工具时间线、恢复接口。
+- `tests/test_recovery.py`：进程重启、幂等提交、审批幂等、操作者身份、工具时间线、恢复接口、发布前库存复核与系统撤回。
 
 ## 目录
 

@@ -35,6 +35,10 @@ def _approval_view(row: sqlite3.Row) -> ApprovalView:
         created_at=parse_dt(row["created_at"]),
         decided_at=parse_dt(row["decided_at"]) if row["decided_at"] else None,
         consumed_at=parse_dt(row["consumed_at"]) if row["consumed_at"] else None,
+        abandoned_at=(
+            parse_dt(row["abandoned_at"]) if row["abandoned_at"] else None
+        ),
+        abandon_reason=row["abandon_reason"],
     )
 
 
@@ -100,7 +104,8 @@ def list_queue(
         "SELECT a.id AS approval_id, t.id AS task_id, a.listing_id,"
         " l.sku_id, l.title, l.spec, l.price_cents AS current_price_cents,"
         " a.original_price_cents, a.new_price_cents, a.proposal_reason,"
-        " a.status, a.decision_note, a.decided_by, a.created_at, a.decided_at"
+        " a.status, a.decision_note, a.decided_by, a.created_at, a.decided_at,"
+        " a.abandoned_at, a.abandon_reason"
         " FROM approvals a"
         " JOIN listings l ON l.id = a.listing_id"
         " LEFT JOIN ("
@@ -140,6 +145,10 @@ def list_queue(
             decided_at=(
                 parse_dt(row["decided_at"]) if row["decided_at"] else None
             ),
+            abandoned_at=(
+                parse_dt(row["abandoned_at"]) if row["abandoned_at"] else None
+            ),
+            abandon_reason=row["abandon_reason"],
         )
         for row in rows
     ]
@@ -204,6 +213,71 @@ def decide_approval(
                 ),
             )
 
+        updated = tx.execute(
+            "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+        ).fetchone()
+
+    return _approval_view(updated)
+
+
+def abandon_approval(
+    db_path: str, approval_id: str, reason: str
+) -> ApprovalView:
+    """Withdraw an approved proposal before it reaches the mall.
+
+    Used by the publish-time inventory recheck. The approval is marked
+    ``abandoned`` (not a human rejection) and its live staging row is
+    discarded in the same transaction. Repeating the call is safe.
+    """
+    now = iso(utcnow())
+
+    with transaction(db_path) as tx:
+        row = tx.execute(
+            "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+        ).fetchone()
+        if row is None:
+            raise ToolFailure(
+                ErrorCode.APPROVAL_NOT_FOUND,
+                f"approval {approval_id!r} does not exist",
+            )
+        status = ApprovalStatus(row["status"])
+        if status is ApprovalStatus.ABANDONED:
+            # Idempotent retry: make sure no staging survived the first call.
+            tx.execute(
+                "UPDATE staging SET status = ?, updated_at = ?"
+                " WHERE approval_id = ? AND status = ?",
+                (
+                    StagingStatus.DISCARDED.value,
+                    now,
+                    approval_id,
+                    StagingStatus.PRICE_STAGED.value,
+                ),
+            )
+            updated = tx.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            return _approval_view(updated)
+        if status is not ApprovalStatus.APPROVED:
+            raise ToolFailure(
+                ErrorCode.APPROVAL_ALREADY_DECIDED,
+                f"approval {approval_id!r} is {status.value}, not approved",
+            )
+
+        tx.execute(
+            "UPDATE approvals SET status = ?, abandoned_at = ?, abandon_reason = ?"
+            " WHERE id = ?",
+            (ApprovalStatus.ABANDONED.value, now, reason, approval_id),
+        )
+        tx.execute(
+            "UPDATE staging SET status = ?, updated_at = ?"
+            " WHERE approval_id = ? AND status = ?",
+            (
+                StagingStatus.DISCARDED.value,
+                now,
+                approval_id,
+                StagingStatus.PRICE_STAGED.value,
+            ),
+        )
         updated = tx.execute(
             "SELECT * FROM approvals WHERE id = ?", (approval_id,)
         ).fetchone()

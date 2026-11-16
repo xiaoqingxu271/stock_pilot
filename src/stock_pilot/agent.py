@@ -345,6 +345,10 @@ def build_graph(
             return finish(
                 state, TaskStatus.ROLLED_BACK, ErrorCode.APPROVAL_REJECTED
             )
+        if approval.status is ApprovalStatus.ABANDONED:
+            return finish(
+                state, TaskStatus.ROLLED_BACK, ErrorCode.INSUFFICIENT_STOCK
+            )
         if approval.status is ApprovalStatus.CONSUMED:
             tasks.update_task(
                 db_path,
@@ -369,12 +373,61 @@ def build_graph(
             return END
         outcome = state.get("approval_outcome")
         if outcome == "approved":
-            return "publish"
+            return "recheck_stock"
         if outcome == "committed":
             return "verify"
         return END
 
-    # -- 5. atomic publish ------------------------------------------------
+    # -- 5. publish-time inventory gate ----------------------------------
+
+    def _abandon_proposal(state: AgentState, reason: str) -> dict[str, Any] | None:
+        """Withdraw the approved proposal; never publish when this fails."""
+        try:
+            client.abandon_approval(state["approval_id"], reason)
+        except ToolFailure as exc:
+            return finish(state, TaskStatus.ABORTED_FAILED, exc.code)
+        except Exception:  # noqa: BLE001 - unknown cleanup outcome, stop
+            return finish(
+                state, TaskStatus.ABORTED_UNKNOWN_STATE, ErrorCode.STATE_UNKNOWN
+            )
+        return None
+
+    def recheck_stock(state: AgentState) -> dict[str, Any]:
+        """A point-in-time stock check immediately before the commit."""
+        result = client.check_inventory(
+            CheckInventoryInput(sku_id=state["sku_id"], spec=state["spec"])
+        )
+        if not result.ok:
+            code = result.error_code or ErrorCode.INTERNAL_ERROR
+            # We cannot verify stock, so we will not publish. Withdraw the
+            # proposal locally (no mall write) instead of leaving an approved
+            # staging row behind for a task that has already stopped.
+            failure = _abandon_proposal(
+                state, f"发布前库存复核失败：{code.value}，系统撤回提案"
+            )
+            if failure is not None:
+                return failure
+            if code is ErrorCode.INVENTORY_NOT_FOUND:
+                return finish(state, TaskStatus.ABORTED_NOT_FOUND, code)
+            return finish(state, TaskStatus.ABORTED_UNKNOWN_STATE, code)
+
+        if result.quantity is None or result.quantity <= 0:
+            failure = _abandon_proposal(
+                state,
+                f"发布前库存复核不通过：quantity={result.quantity}",
+            )
+            if failure is not None:
+                return failure
+            return finish(
+                state, TaskStatus.ROLLED_BACK, ErrorCode.INSUFFICIENT_STOCK
+            )
+
+        return {}
+
+    def route_after_recheck(state: AgentState) -> str:
+        return END if _is_terminal(state) else "publish"
+
+    # -- 6. atomic publish ------------------------------------------------
 
     def publish(state: AgentState) -> dict[str, Any]:
         result = client.publish_listing(
@@ -436,7 +489,7 @@ def build_graph(
             return "verify"
         return END
 
-    # -- 6. final read-only verification ---------------------------------
+    # -- 7. final read-only verification ---------------------------------
 
     def verify(state: AgentState) -> dict[str, Any]:
         result = client.get_listing(GetListingInput(sku_id=state["sku_id"]))
@@ -504,6 +557,7 @@ def build_graph(
     builder.add_node("resolve_listing", resolve_listing)
     builder.add_node("stage_price", stage_price)
     builder.add_node("await_approval", await_approval)
+    builder.add_node("recheck_stock", recheck_stock)
     builder.add_node("publish", publish)
     builder.add_node("verify", verify)
 
@@ -522,7 +576,12 @@ def build_graph(
     builder.add_conditional_edges(
         "await_approval",
         route_after_approval,
-        {"publish": "publish", "verify": "verify", END: END},
+        {"recheck_stock": "recheck_stock", "verify": "verify", END: END},
+    )
+    builder.add_conditional_edges(
+        "recheck_stock",
+        route_after_recheck,
+        {"publish": "publish", END: END},
     )
     builder.add_conditional_edges(
         "publish", route_after_publish, {"verify": "verify", END: END}
@@ -583,7 +642,10 @@ def _approval_matches_decision(approval, decision: ApprovalDecision) -> bool:
             ApprovalStatus.APPROVED,
             ApprovalStatus.CONSUMED,
         )
-    return approval.status is ApprovalStatus.REJECTED
+    return approval.status in (
+        ApprovalStatus.REJECTED,
+        ApprovalStatus.ABANDONED,
+    )
 
 
 def decide_and_resume(

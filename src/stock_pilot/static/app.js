@@ -28,14 +28,17 @@
     approved: { label: "已通过", tone: "info" },
     rejected: { label: "已拒绝", tone: "danger" },
     consumed: { label: "已提交", tone: "success" },
+    abandoned: { label: "系统撤回", tone: "danger" },
   };
 
   const RECOVERY_KIND = {
     approved_not_published: "已审批未提交",
     rejected_not_closed: "已拒绝未关闭",
+    abandoned_not_closed: "系统撤回未关闭",
     published_verify_pending: "已提交待核对",
     approval_missing: "审批记录缺失",
     approved_without_staging: "有效提案缺失",
+    staging_orphaned: "遗留提案",
     interrupted_before_approval: "执行中断",
   };
 
@@ -225,11 +228,18 @@
     const label = RECOVERY_KIND[issue.kind] || issue.kind;
     const card = h("article", "recovery-card");
 
+    const title = issue.sku_id
+      ? `${issue.sku_id} · ${issue.spec}`
+      : `listing ${issue.listing_id || "—"}`;
     const head = h("div", "card-head");
     const titleWrap = h("div");
     titleWrap.append(
-      h("h3", "card-title", `${issue.sku_id} · ${issue.spec}`),
-      h("p", "card-meta", `${label} · task ${shortId(issue.task_id)}`)
+      h("h3", "card-title", title),
+      h(
+        "p",
+        "card-meta",
+        `${label} · ${issue.task_id ? `task ${shortId(issue.task_id)}` : "无关联任务"}`
+      )
     );
     head.append(titleWrap, h("span", "chip chip-warn", label));
     card.append(head);
@@ -239,9 +249,9 @@
       h(
         "p",
         "card-meta",
-        `当前 ${statusMeta(issue.task_status).label} · 目标 ${money(issue.target_price)} · listing ${
-          issue.listing_id || "—"
-        }`
+        `当前 ${issue.task_status ? statusMeta(issue.task_status).label : "未知"} · 目标 ${money(
+          issue.target_price
+        )} · listing ${issue.listing_id || "—"}`
       )
     );
 
@@ -253,6 +263,7 @@
       [
         "approved_not_published",
         "rejected_not_closed",
+        "abandoned_not_closed",
         "published_verify_pending",
       ].includes(issue.kind);
     recover.disabled = !recoverable;

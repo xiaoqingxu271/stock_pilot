@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 from conftest import count_rows, fetch_one
 from fastapi.testclient import TestClient
 
@@ -260,6 +262,7 @@ def test_tool_events_form_a_task_timeline(settings: Settings):
         "check_inventory",
         "get_listing",
         "update_price",
+        "check_inventory",
         "publish_listing",
         "get_listing",
     ]
@@ -272,6 +275,82 @@ def test_tool_events_form_a_task_timeline(settings: Settings):
 def test_tool_events_404_for_unknown_task(settings: Settings):
     with new_client(settings) as client:
         assert client.get("/tasks/task_missing/events").status_code == 404
+
+
+def test_publish_recheck_abandons_when_stock_depleted(settings: Settings):
+    with new_client(settings) as client:
+        task = submit(client)
+
+        with sqlite3.connect(settings.db_path) as conn:
+            conn.execute(
+                "UPDATE inventory_records SET quantity = 0 WHERE id = 'INV-001'"
+            )
+
+        decided = client.post(
+            f"/approvals/{task['approval_id']}/decision",
+            json={"decision": "approve", "note": "同意"},
+        )
+        assert decided.status_code == 200
+        done = decided.json()
+        assert done["status"] == "rolled_back"
+        assert done["error_code"] == "INSUFFICIENT_STOCK"
+
+        record = client.get(f"/approvals/{task['approval_id']}").json()
+        assert record["status"] == "abandoned"
+        assert "发布前库存" in record["abandon_reason"]
+        assert record["abandoned_at"] is not None
+
+        events = client.get(f"/tasks/{task['task_id']}/events").json()
+        assert [event["tool"] for event in events] == [
+            "check_inventory",
+            "get_listing",
+            "update_price",
+            "check_inventory",
+        ]
+        assert events[-1]["outcome"] == "ok"
+        assert client.get("/recovery").json() == []
+
+    row = fetch_one(
+        settings, "SELECT price_cents, status FROM listings WHERE id = 'LST-001'"
+    )
+    assert row["price_cents"] == 7900
+    assert row["status"] == "draft"
+
+    staging = approval.get_staging_for_approval(settings.db_path, task["approval_id"])
+    assert staging is not None
+    assert staging.status is StagingStatus.DISCARDED
+
+
+def test_recovery_reports_abandoned_but_not_closed(settings: Settings):
+    with new_client(settings) as client:
+        task = submit(client)
+        approval.decide_approval(
+            settings.db_path,
+            task["approval_id"],
+            ApprovalDecision.APPROVE,
+            "同意",
+            "李四",
+        )
+        approval.abandon_approval(
+            settings.db_path, task["approval_id"], "发布前库存复核不通过"
+        )
+
+        issues = client.get("/recovery").json()
+        assert len(issues) == 1
+        assert issues[0]["kind"] == "abandoned_not_closed"
+        assert issues[0]["approval_status"] == "abandoned"
+        assert issues[0]["staging_status"] == "discarded"
+
+        recovered = client.post(f"/tasks/{task['task_id']}/recover")
+        assert recovered.status_code == 200
+        assert recovered.json()["status"] == "rolled_back"
+        assert recovered.json()["error_code"] == "INSUFFICIENT_STOCK"
+
+    row = fetch_one(
+        settings, "SELECT price_cents, status FROM listings WHERE id = 'LST-001'"
+    )
+    assert row["price_cents"] == 7900
+    assert row["status"] == "draft"
 
 
 def test_decision_request_model_exposes_operator():
