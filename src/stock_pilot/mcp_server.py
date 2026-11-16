@@ -139,6 +139,9 @@ def build_mcp_server(tools: StockPilotTools | None = None) -> MCPServer:
 
 
 def main() -> None:
+    from stock_pilot.logging_config import configure_logging
+
+    configure_logging()
     transport = os.environ.get("STOCK_PILOT_MCP_TRANSPORT", "stdio")
     build_mcp_server().run(transport=transport)
 

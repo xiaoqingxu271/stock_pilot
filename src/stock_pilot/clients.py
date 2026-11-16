@@ -1,9 +1,10 @@
 """Tool-client boundary used by the LangGraph orchestrator.
 
 ``StockPilotTools`` is the in-process implementation. ``MCPToolClient`` runs
-the same four tools over the real MCP protocol (stdio), while approval-queue
-reads/decisions stay local because the queue is a human admin plane, not one
-of the four contracted MCP tools.
+the same four tools over the real MCP protocol (stdio or Streamable HTTP),
+supervising the session with pings and bounded-backoff reconnects, while
+approval-queue reads/decisions stay local because the queue is a human admin
+plane, not one of the four contracted MCP tools.
 """
 
 from __future__ import annotations
@@ -49,6 +50,10 @@ from stock_pilot.runner import ToolExecutor
 from stock_pilot.tools import StockPilotTools
 
 TOutput = TypeVar("TOutput", bound=ToolOutput)
+
+_RECONNECT_INITIAL_SECONDS = 0.5
+_RECONNECT_MAX_SECONDS = 10.0
+_HEALTH_INTERVAL_SECONDS = 2.0
 
 
 @runtime_checkable
@@ -136,7 +141,7 @@ class _LocalApprovalPlane:
 
 
 class MCPToolClient(_LocalApprovalPlane):
-    """Synchronous facade over a long-lived MCP stdio client session."""
+    """Synchronous facade over a supervised MCP client session."""
 
     def __init__(
         self,
@@ -169,6 +174,7 @@ class MCPToolClient(_LocalApprovalPlane):
         self._session: ClientSession | None = None
         self._error: BaseException | None = None
         self._closed = False
+        self._stop_event: asyncio.Event | None = None
 
         self._url = url
         self._headers = dict(headers or {})
@@ -221,24 +227,83 @@ class MCPToolClient(_LocalApprovalPlane):
             yield read, write
 
     async def _main(self) -> None:
+        """Hold a session, reconnecting with bounded exponential backoff.
+
+        Reconnection only restores transport. It never replays a write: calls
+        made while the session is down fail fast with ``TOOL_UNAVAILABLE`` and
+        the orchestrator's failure policy takes over.
+        """
+        stop = asyncio.Event()
+        self._stop_event = stop
+        delay = _RECONNECT_INITIAL_SECONDS
+        while not stop.is_set() and not self._closed:
+            try:
+                async with self._transport() as (read, write):
+                    async with ClientSession(
+                        read,
+                        write,
+                        read_timeout_seconds=self.settings.tool_timeout_seconds,
+                    ) as session:
+                        await session.initialize()
+                        self._session = session
+                        self._error = None
+                        delay = _RECONNECT_INITIAL_SECONDS
+                        self._ready.set()
+                        await self._hold_session(session, stop)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - surfaced as unavailable
+                self._error = exc
+                self._ready.set()
+            finally:
+                self._session = None
+
+            if stop.is_set() or self._closed:
+                break
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            delay = min(delay * 2, _RECONNECT_MAX_SECONDS)
+
+    async def _hold_session(
+        self, session: ClientSession, stop: asyncio.Event
+    ) -> None:
+        """Wait for shutdown or loss of the peer.
+
+        The MCP HTTP transport does not surface a dropped server stream on its
+        own, so a periodic ping is what turns "session object still exists"
+        into real availability. A failed ping unwinds the transport and the
+        outer loop reconnects with backoff.
+        """
+        release = asyncio.Event()
+
+        async def watch_stop() -> None:
+            await stop.wait()
+            release.set()
+
+        async def probe() -> None:
+            while True:
+                await asyncio.sleep(_HEALTH_INTERVAL_SECONDS)
+                try:
+                    await session.send_ping()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - any failure means lost
+                    self._error = exc
+                    release.set()
+                    return
+
+        tasks = [
+            asyncio.create_task(watch_stop()),
+            asyncio.create_task(probe()),
+        ]
         try:
-            async with self._transport() as (read, write):
-                async with ClientSession(
-                    read,
-                    write,
-                    read_timeout_seconds=self.settings.tool_timeout_seconds,
-                ) as session:
-                    await session.initialize()
-                    self._session = session
-                    self._ready.set()
-                    await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            raise
-        except BaseException as exc:  # noqa: BLE001 - surfaced as unavailable
-            self._error = exc
-            self._ready.set()
+            await release.wait()
         finally:
-            self._session = None
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def close(self) -> None:
         if self._closed:
@@ -402,6 +467,9 @@ class MCPToolClient(_LocalApprovalPlane):
     def is_available(self) -> bool:
         return not self._closed and self._session is not None
 
+    def circuit_states(self) -> dict[str, bool]:
+        return self._executor.circuit_states()
+
     # -- introspective helper for integration tests ----------------------
 
     def list_tools(self) -> list[Any]:
@@ -459,6 +527,11 @@ class SplitMCPToolClient(_LocalApprovalPlane):
 
     def is_available(self) -> bool:
         return self._inventory.is_available() and self._mall.is_available()
+
+    def circuit_states(self) -> dict[str, bool]:
+        states = self._inventory.circuit_states()
+        states.update(self._mall.circuit_states())
+        return states
 
     def close(self) -> None:
         self._inventory.close()

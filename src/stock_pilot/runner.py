@@ -7,6 +7,7 @@ read-only reconciliation and then stop — never continue with more writes.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -24,6 +25,8 @@ from stock_pilot.errors import (
     ToolTimeoutError,
     ToolUnavailableError,
 )
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -62,13 +65,34 @@ class ToolExecutor:
         code: ErrorCode | None,
         started_at: float,
     ) -> None:
+        latency_ms = int((time.monotonic() - started_at) * 1000)
+        logger.info(
+            "tool attempt",
+            extra={
+                "tool": name,
+                "attempt": attempt,
+                "outcome": outcome.value,
+                "error_code": code.value if code is not None else None,
+                "latency_ms": latency_ms,
+            },
+        )
         if self._event_sink is None:
             return
-        latency_ms = (time.monotonic() - started_at) * 1000
         try:
-            self._event_sink(name, attempt, outcome, code, int(latency_ms))
+            self._event_sink(name, attempt, outcome, code, latency_ms)
         except Exception:  # noqa: BLE001 - audit must not break the call
             pass
+
+    def circuit_states(self) -> dict[str, bool]:
+        """Read-only snapshot for metrics: open means rejecting calls now."""
+        now = time.monotonic()
+        with self._lock:
+            return {
+                name: state.opened_at is not None
+                and now - state.opened_at
+                < self._settings.circuit_cooldown_seconds
+                for name, state in self._circuits.items()
+            }
 
     def _state(self, name: str) -> _CircuitState:
         with self._lock:

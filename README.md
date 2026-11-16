@@ -76,6 +76,8 @@ check_inventory → get_listing → update_price（审批）
 
 **健康检查**：`GET /healthz` 返回数据库连通性、工具客户端可用性、待审批数与恢复问题数；数据库或工具客户端不可用时返回 `503` 与 `status=degraded`，部署层据此摘流量，避免在工具不可用时接收新的写任务。
 
+**观测性（E2）**：`GET /metrics` 输出 Prometheus 指标（任务状态、工具尝试与耗时、审批积压、恢复问题、熔断、工具客户端可用性），与 `/healthz`、`tool_events` 同源。设置 `STOCK_PILOT_LOG_FORMAT=json` 后每次工具尝试输出一行结构化日志（含 `task_id`、工具、结果、耗时，不含 Token）。MCP 客户端每 2 秒 ping 一次，断线后以 0.5s→10s 指数退避自动重连；重连只恢复传输，绝不重放写操作。指标含义、告警规则与日志字段见 `docs/observability.md`。
+
 ## 快速开始
 
 Windows Git Bash：
@@ -97,6 +99,9 @@ export STOCK_PILOT_OPERATOR_TOKEN=demo-operator-token
 ./.venv/Scripts/python.exe -m stock_pilot.mcp_inventory &   # 127.0.0.1:8101/mcp
 ./.venv/Scripts/python.exe -m stock_pilot.mcp_mall &        # 127.0.0.1:8102/mcp
 STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
+
+# 结构化日志（默认 text；json 便于采集）
+STOCK_PILOT_LOG_FORMAT=json ./.venv/Scripts/python.exe -m stock_pilot.api
 
 # 全量回归
 ./.venv/Scripts/python.exe -m pytest -q
@@ -132,6 +137,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 | `GET` | `/approvals/{id}` | 单条审批详情 |
 | `GET` | `/recovery` | 只读重启对账结果 |
 | `GET` | `/healthz` | 就绪检查；不可用时 `503` + `status=degraded` |
+| `GET` | `/metrics` | Prometheus 文本格式指标（不做鉴权，供抓取） |
 
 审批决策是幂等的：重复提交相同决策返回当前任务；提交相反决策返回 `409`。
 
@@ -153,7 +159,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 82 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 89 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -168,6 +174,8 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_auth.py`：角色鉴权、跨角色拒绝、身份覆盖请求体、撤回操作人留痕、只读鉴权开关、admin 自审告警。
 - `tests/test_concurrency.py`：并发 staging 只产生一个提案、相反审批只有一个生效、并发发布只提交一次、相同 `Idempotency-Key` 并发提交只建一个任务。
 - `tests/test_recovery.py`：进程重启、幂等提交、审批幂等、操作者身份、工具时间线、恢复接口（含已提交任务只读核对）、发布前与事务内库存复核、遗留提案撤回。
+- `tests/test_observability.py`：`/metrics` 数值（任务、工具事件、耗时、熔断、降级）、JSON 日志字段与 `task_id`、白名单（Token 不入日志）、`/healthz` 降级。
+- `tests/test_reconnect.py`：HTTP MCP Server 停机 → 任务安全中止 → 同端口重启 → 自动重连 → 新任务完成，审计中只有一次成功 `publish_listing`。
 
 ## 目录
 
@@ -182,6 +190,8 @@ src/stock_pilot/
   clients.py      ToolClient 边界 + stdio / 拆分 HTTP 客户端
   runner.py       超时 / 重试 / 熔断 / 审计事件
   audit.py        工具调用时间线
+  metrics.py      Prometheus 指标（从 SQLite 与执行器派生）
+  logging_config.py JSON / 文本日志配置
   auth.py         静态 Bearer Token 与角色
   recovery.py     只读重启对账
   agent.py        LangGraph 状态机
@@ -197,6 +207,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 ## 文档
 
 - `docs/demo.md`：约 8 分钟的面试演示脚本，含失败路径与拆分/鉴权演示。
+- `docs/observability.md`：指标、告警规则、结构化日志与断线重连语义。
 - `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理的决策记录。
 
 ## 设计取舍与生产化
@@ -208,6 +219,6 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 1. 两个工具 Server 各自持有独立数据库与服务间鉴权；当前演示仍共享同一个 SQLite 文件。
 2. Postgres 替换 SQLite；跨服务提交从单库事务改为 saga / 补偿，明确每一步的一致性边界。
 3. 静态 Token 换成 OIDC / 真实登录；只读鉴权已可通过 `STOCK_PILOT_REQUIRE_READ_AUTH` 开启，生产再接入统一网关。
-4. 结构化日志、指标、告警与审批审计导出。
+4. 指标与结构化日志已落地（Prometheus `/metrics`、JSON 日志）；生产再接入告警平台、日志聚合与审批审计导出。
 
 已知限制：共享 SQLite 适合单实例演示，拆分 Server 只是拓扑演练；静态 Token 没有轮换与细粒度权限；admin 自审只告警不阻断（正常流程由角色分离保证审批人 ≠ 提交人）。

@@ -9,6 +9,9 @@ from stock_pilot.mcp_server import build_mall_server
 
 
 def main() -> None:
+    from stock_pilot.logging_config import configure_logging
+
+    configure_logging()
     run_http_server(
         build_mall_server(),
         host=os.environ.get("STOCK_PILOT_BIND_HOST", "127.0.0.1"),

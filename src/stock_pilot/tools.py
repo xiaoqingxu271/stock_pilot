@@ -130,6 +130,9 @@ class StockPilotTools:
     def is_available(self) -> bool:
         return True
 
+    def circuit_states(self) -> dict[str, bool]:
+        return self.executor.circuit_states()
+
     # -- human approval queue (not MCP tools) -----------------------------
 
     def decide_approval(self, approval_id, decision, note=None, decided_by=None):

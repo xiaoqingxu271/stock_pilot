@@ -43,6 +43,7 @@ from stock_pilot.enums import (
     TaskStatus,
 )
 from stock_pilot.errors import ToolFailure
+from stock_pilot.metrics import render_metrics
 from stock_pilot.models import (
     AbandonApprovalRequest,
     ApprovalDecisionRequest,
@@ -288,6 +289,24 @@ def create_app(
             checked_at=utcnow(),
         )
 
+    @app.get("/metrics", include_in_schema=False)
+    def metrics_snapshot() -> Response:
+        states = getattr(client, "circuit_states", None)
+        circuit_states = states() if callable(states) else {}
+        probe = getattr(client, "is_available", None)
+        try:
+            available = bool(probe()) if callable(probe) else True
+        except Exception:  # noqa: BLE001 - a failing probe means unavailable
+            available = False
+        return Response(
+            content=render_metrics(
+                db_path,
+                circuit_states=circuit_states,
+                tool_client_available=available,
+            ),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
     @app.post("/tasks/{task_id}/recover", response_model=TaskView)
     def recover_task(
         task_id: str,
@@ -476,6 +495,9 @@ def create_app(
 def main() -> None:
     import uvicorn
 
+    from stock_pilot.logging_config import configure_logging
+
+    configure_logging()
     uvicorn.run(
         "stock_pilot.api:create_app",
         factory=True,

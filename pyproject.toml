@@ -15,6 +15,7 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=3",
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]
