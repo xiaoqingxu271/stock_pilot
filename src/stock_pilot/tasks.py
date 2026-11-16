@@ -6,6 +6,7 @@ import json
 import sqlite3
 from decimal import Decimal
 
+from stock_pilot import notifications
 from stock_pilot.db import connect, iso, new_id, parse_dt, transaction, utcnow
 from stock_pilot.enums import ErrorCode, TaskStatus
 from stock_pilot.models import (
@@ -148,6 +149,9 @@ def update_task(
         tx.execute(
             f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?", values
         )
+        # Task state and its notification share one transaction: either both
+        # commit or neither does. Delivery is a later, at-least-once step.
+        notifications.enqueue_terminal(tx, task_id)
 
     task = get_task(db_path, task_id)
     assert task is not None

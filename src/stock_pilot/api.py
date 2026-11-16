@@ -21,7 +21,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from stock_pilot import approval, audit, auth, mall, recovery, reservations, tasks
+from stock_pilot import (
+    approval,
+    audit,
+    auth,
+    mall,
+    notifications,
+    recovery,
+    reservations,
+    tasks,
+)
 from stock_pilot.agent import (
     build_graph,
     confirm_mapping_and_resume,
@@ -105,6 +114,10 @@ def create_app(
     db_path = settings.db_path
     approval_db = settings.approval_db
     mall_db = settings.store_mall
+    # Notification-only worker: it is constructed without any tool client.
+    outbox_worker = notifications.OutboxWorker(
+        db_path, interval_seconds=settings.outbox_interval_seconds
+    )
 
     def scan_recovery():
         return recovery.scan(
@@ -123,10 +136,14 @@ def create_app(
                 len(issues),
                 ", ".join(f"{issue.task_id}:{issue.kind.value}" for issue in issues),
             )
-        yield
-        closer = getattr(client, "close", None)
-        if callable(closer):
-            closer()
+        outbox_worker.start()
+        try:
+            yield
+        finally:
+            outbox_worker.stop()
+            closer = getattr(client, "close", None)
+            if callable(closer):
+                closer()
 
     app = FastAPI(
         title="StockPilot",
@@ -139,6 +156,7 @@ def create_app(
     app.state.tool_client = client
     app.state.graph = graph
     app.state.checkpointer = checkpointer
+    app.state.outbox_worker = outbox_worker
 
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

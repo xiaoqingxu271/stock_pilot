@@ -54,8 +54,9 @@ split 布局下库存 Server 额外注册内部工具 `reserve_inventory` / `rel
 11. **鉴权与拆分（B1）**：静态 Bearer Token 映射 agent / operator / admin 三角色；任一 Token 配置即强制校验，身份写入 `submitted_by` / `decided_by` / `abandoned_by`。库存与商城各一个 Streamable HTTP MCP Server，只接受 agent Token；审批面仍留在编排进程。只读接口默认开放，`STOCK_PILOT_REQUIRE_READ_AUTH=true` 时纳入鉴权。正常流程靠角色分离保证审批人 ≠ 提交人；admin 自审（break-glass）会写 warning 日志，`submitted_by == decided_by` 可在审计中识别。
 12. **并发不变量**：所有写路径使用 `BEGIN IMMEDIATE` 串行化；每个 listing 的活动 staging 由部分唯一索引兜底；审批消费与商城提交在同一事务。并发初始化同一演示库时在写事务内复查行数，只有一次 seed；schema 创建对 `database is locked` 短暂重试。测试覆盖并发 staging / 相反审批 / 并发发布 / 相同幂等键提交 / 并发初始化，要求每次只有一个赢家。
 13. **观测与重连（E2）**：指标只从权威状态派生（SQLite 任务与工具事件、执行器熔断快照），工具事件只统计带 `task_id` 的编排侧记录，避免 MCP 双写重复计数；JSON 日志只输出白名单字段，不含 Token。MCP 客户端用 2 秒 ping 探测会话、0.5s→10s 退避重连；重连只恢复传输，禁止重放写操作。
-14. **三库与发布 saga（E3）**：split 布局下 `orchestrator.db`（tasks/tool_events）、`inventory.db`（inventory_records + `reserved_by`/`reserved_at`）、`mall.db`（listings/staging/approvals）彼此独立。审批与 mall 写同库，保证 staging + approval 原子；发布链路为「复核 → `reserve_inventory` → 商城事务提交 → 回写任务 → 尽力释放预留」。商城已提交但响应丢失时，只做一次只读 `get_listing` 并采纳已提交事实，绝不重发写；补偿只释放预留、撤回未提交提案，不回滚已提交事实。刻意不引入会重投写操作的 outbox。详见 `docs/adr/0005`。
+14. **三库与发布 saga（E3）**：split 布局下 `orchestrator.db`（tasks/tool_events）、`inventory.db`（inventory_records + `reserved_by`/`reserved_at`）、`mall.db`（listings/staging/approvals）彼此独立。审批与 mall 写同库，保证 staging + approval 原子；发布链路为「复核 → `reserve_inventory` → 商城事务提交 → 回写任务 → 尽力释放预留」。商城已提交但响应丢失时，只做一次只读 `get_listing` 并采纳已提交事实，绝不重发写；补偿只释放预留、撤回未提交提案，不回滚已提交事实。刻意不引入会重投写操作的 outbox（仅通知的 outbox 见决策 16）。详见 `docs/adr/0005`。
 15. **预留 TTL 与清理（E5）**：`STOCK_PILOT_RESERVATION_TTL`（默认 900s）只是观测门槛，不是释放许可。`POST /reservations/gc` 只释放审批已 `consumed` / `rejected` / `abandoned`、审批缺失或任务已终态的预留；审批仍可发布且任务活跃的预留绝不自动释放，超龄只标记 `reservation_stale`。`GET /reservations` 只读列出预留；恢复扫描与指标分别暴露 `reservation_orphaned` / `reservation_stale` 与 `stock_pilot_reservations_open` / `stock_pilot_reservations_stale`。详见 `docs/adr/0006`。
+16. **通知 outbox（P2）**：`outbox_events` 只在编排库；任务终态与事件在同一事务写入，`dedupe_key` 唯一。worker 只持有数据库路径与 `NotificationSender`，不持有 `ToolClient`，因此结构上不能重投写操作；投递至少一次，失败保留 pending 并记录 `attempts` / `last_error`。默认发送器只写结构化日志；外部 webhook / 死信清理未实现。详见 `docs/adr/0007`。
 
 ## 验收用例（至少 5 条，每次改动后回归）
 
@@ -123,7 +124,7 @@ export STOCK_PILOT_OPERATOR_TOKEN=demo-operator-token
 STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 ```
 
-配置通过环境变量覆盖：`STOCK_PILOT_DB`、`STOCK_PILOT_DB_LAYOUT`（`shared` 默认 / `split`）、`STOCK_PILOT_INVENTORY_DB`、`STOCK_PILOT_MALL_DB`、`STOCK_PILOT_TOOL_TIMEOUT`、`STOCK_PILOT_READ_RETRIES`、`STOCK_PILOT_CIRCUIT_THRESHOLD`、`STOCK_PILOT_CIRCUIT_COOLDOWN`、`STOCK_PILOT_RESERVATION_TTL`、`STOCK_PILOT_TOOL_CLIENT`（`inprocess` 默认 / `mcp` / `mcp-http`）、`STOCK_PILOT_MCP_TRANSPORT`、`STOCK_PILOT_HOST`、`STOCK_PILOT_PORT`、`STOCK_PILOT_INVENTORY_URL`、`STOCK_PILOT_MALL_URL`、`STOCK_PILOT_AGENT_TOKEN`、`STOCK_PILOT_OPERATOR_TOKEN`、`STOCK_PILOT_ADMIN_TOKEN`、`STOCK_PILOT_REQUIRE_READ_AUTH`、`STOCK_PILOT_INVENTORY_PORT`、`STOCK_PILOT_MALL_PORT`、`STOCK_PILOT_BIND_HOST`、`STOCK_PILOT_LOG_FORMAT`（`text` 默认 / `json`）、`STOCK_PILOT_LOG_LEVEL`。
+配置通过环境变量覆盖：`STOCK_PILOT_DB`、`STOCK_PILOT_DB_LAYOUT`（`shared` 默认 / `split`）、`STOCK_PILOT_INVENTORY_DB`、`STOCK_PILOT_MALL_DB`、`STOCK_PILOT_TOOL_TIMEOUT`、`STOCK_PILOT_READ_RETRIES`、`STOCK_PILOT_CIRCUIT_THRESHOLD`、`STOCK_PILOT_CIRCUIT_COOLDOWN`、`STOCK_PILOT_RESERVATION_TTL`、`STOCK_PILOT_OUTBOX_INTERVAL`、`STOCK_PILOT_TOOL_CLIENT`（`inprocess` 默认 / `mcp` / `mcp-http`）、`STOCK_PILOT_MCP_TRANSPORT`、`STOCK_PILOT_HOST`、`STOCK_PILOT_PORT`、`STOCK_PILOT_INVENTORY_URL`、`STOCK_PILOT_MALL_URL`、`STOCK_PILOT_AGENT_TOKEN`、`STOCK_PILOT_OPERATOR_TOKEN`、`STOCK_PILOT_ADMIN_TOKEN`、`STOCK_PILOT_REQUIRE_READ_AUTH`、`STOCK_PILOT_INVENTORY_PORT`、`STOCK_PILOT_MALL_PORT`、`STOCK_PILOT_BIND_HOST`、`STOCK_PILOT_LOG_FORMAT`（`text` 默认 / `json`）、`STOCK_PILOT_LOG_LEVEL`。
 
 鉴权：任一 Token 配置即启用校验；`POST /tasks` 需 agent，审批/映射/恢复/撤回需 operator，admin 覆盖两者；`decided_by` / `abandoned_by` 取自身份。审批台「管理令牌」输入框把 Token 放进 `Authorization` 头（sessionStorage 保存，输入后自动刷新）；只读接口默认开放，`STOCK_PILOT_REQUIRE_READ_AUTH=true` 时要求任一有效 Token（`/healthz` 除外）。未配置 Token 时是本地无鉴权演示模式。
 
@@ -133,7 +134,7 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 
 **数据层**
 
-- `db.py`：默认单个 SQLite 文件（WAL），三块 module 边界：`inventory_records`（库存）、`listings`/`staging`（商城）、`approvals`（审批），外加 `tasks` 审计记录和 `tool_events` 工具时间线。跨模块提交（改价 + 上架 + 消费审批）在同一个 `BEGIN IMMEDIATE` 事务内完成。`INVENTORY_SCHEMA` / `MALL_SCHEMA` / `ORCHESTRATOR_SCHEMA` 可按 split 布局写入三个文件（`initialize_split_stores`）；`listings` 不再有跨库外键，库存预留字段通过增量迁移补齐。
+- `db.py`：默认单个 SQLite 文件（WAL），三块 module 边界：`inventory_records`（库存）、`listings`/`staging`（商城）、`approvals`（审批），外加 `tasks` 审计记录、`tool_events` 工具时间线与 `outbox_events` 通知事件（仅编排库）。跨模块提交（改价 + 上架 + 消费审批）在同一个 `BEGIN IMMEDIATE` 事务内完成。`INVENTORY_SCHEMA` / `MALL_SCHEMA` / `ORCHESTRATOR_SCHEMA` 可按 split 布局写入三个文件（`initialize_split_stores`）；`listings` 不再有跨库外键，库存预留字段通过增量迁移补齐。
 - 金额统一用「分」存 SQLite，边界层用 `Decimal`；`models.to_cents/from_cents` 是唯一转换点。`db.parse_dt` 把不带时区的历史时间戳按 UTC 解释，避免与 `utcnow()` 做差时抛异常。
 - `staging` 有部分唯一索引：每个 listing 最多存在一条 `price_staged` 提案。
 - 增量迁移在 `initialize_database` 内执行：补 `approvals.decided_by` / `abandoned_at` / `abandon_reason` / `abandoned_by`、`tasks.idempotency_key` 与唯一索引，保证旧 demo 库可直接打开。
@@ -142,8 +143,9 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 
 - `inventory.py` / `mall.py` / `approval.py`：纯业务函数；业务违规抛 `ToolFailure(ErrorCode)`，由 `tools.py` 转成 `ok=False` 的结构化输出。
 - `reservations.py`：预留清理的唯一决策点 `disposition()` 与 `sweep()`。只释放审批已终止 / 缺失或任务已终态的预留；`approved` 且任务活跃的预留即使超过 TTL 也只标记 stale。`sweep()` 通过 `ToolClient` 读预留与释放，审批与任务走本地库，不引入新持久状态。
+- `notifications.py`：仅通知的 outbox。`enqueue_terminal()` 由 `tasks.update_task()` 在**同一事务**内调用；`OutboxWorker` 只持有数据库路径与 `NotificationSender`，**不持有 `ToolClient`**，因此结构上不可能重投写操作。投递至少一次，发送失败保留 pending 并累计 `attempts`/`last_error`；默认 `LogSender` 只写结构化日志。
 - `runner.py`：每次调用有硬超时；只读工具可重试，写工具只执行一次；每个工具独立熔断器（连续失败达阈值后打开，冷却后半开）。`ToolFailure` 不计入熔断。每次尝试通过 `event_sink` 上报 `ToolOutcome` 与耗时，并输出一条带 `tool/attempt/outcome/error_code/latency_ms` 的日志；审计写失败不影响业务结果。`circuit_states()` 供指标读取熔断快照。
-- `metrics.py`：`GET /metrics` 的 Prometheus collector，每次抓取新建 registry。任务状态、工具事件与耗时从编排库派生，审批积压从 mall 库派生（`mall_db_path`），恢复问题跨库扫描；熔断与客户端可用性由调用方传入。工具事件只统计 `task_id IS NOT NULL` 的编排侧记录，避免 MCP 模式下服务端与客户端双写导致重复计数。预留相关 gauge：`stock_pilot_reservations_open` 直接读库存库，`stock_pilot_reservations_stale` 取自恢复扫描的 `reservation_stale`。
+- `metrics.py`：`GET /metrics` 的 Prometheus collector，每次抓取新建 registry。任务状态、工具事件与耗时从编排库派生，审批积压从 mall 库派生（`mall_db_path`），恢复问题跨库扫描；熔断与客户端可用性由调用方传入。工具事件只统计 `task_id IS NOT NULL` 的编排侧记录，避免 MCP 模式下服务端与客户端双写导致重复计数。预留相关 gauge：`stock_pilot_reservations_open` 直接读库存库，`stock_pilot_reservations_stale` 取自恢复扫描的 `reservation_stale`；`stock_pilot_outbox_pending` 读编排库未投递通知数。
 - `logging_config.py`：`STOCK_PILOT_LOG_FORMAT=json` 时每条日志一个 JSON 对象（`ts/level/logger/message` + 白名单 `task_id/tool/attempt/outcome/error_code/latency_ms`），字段与 `tool_events` 对齐；不输出 Token / Authorization 头。`configure_logging()` 在 API 与三个 MCP Server 入口调用。
 - `audit.py`：`task_context()` 用 ContextVar 关联任务；`make_event_sink()` 把每次工具尝试写入 `tool_events`（`task_id / tool / attempt / outcome / error_code / latency_ms`），`GET /tasks/{id}/events` 读取。
 - `tools.py`：`StockPilotTools` 门面，把超时/熔断/内部异常统一映射为 `TOOL_TIMEOUT` / `TOOL_UNAVAILABLE` / `CIRCUIT_OPEN` / `INTERNAL_ERROR`。按工具路由存储：库存工具走 `store_inventory`，商城工具走 `store_mall`，审批走 `approval_db`，审计走 `store_orchestrator`。split 模式下实现内部 `reserve_inventory` / `release_inventory` / `list_reservations`，并在 `publish_listing` 关闭单库库存校验；`reserve_inventory` 输出附带 `reserved_at` / `expires_at`（TTL 仅观测）。
@@ -184,8 +186,8 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 
 **服务层**
 
-- `api.py`：操作接口 `POST /tasks`（支持 `Idempotency-Key`，冲突返回 `IDEMPOTENCY_CONFLICT`；需 agent）、`POST /approvals/{approval_id}/decision`（可带 `decided_by`；需 operator）、`POST /approvals/{approval_id}/abandon`（需 operator）、`POST /tasks/{task_id}/mapping`、`POST /tasks/{task_id}/recover`（需 operator）、`POST /reservations/gc`（需 operator，只释放审批不可再发布的预留）；只读接口 `GET /tasks`、`GET /tasks/{id}`、`GET /tasks/{id}/events`、`GET /recovery`、`GET /reservations`、`GET /healthz`（任一存储不可读或工具客户端不可用时 503 + `degraded`）、`GET /approvals`、`GET /approvals/{id}`、`GET /approvals/queue`（联表返回商品与任务上下文）；`GET /metrics` 输出 Prometheus 文本（不鉴权，供抓取）。配置 Token 后 `decided_by` / `abandoned_by` 以身份为准，忽略请求体；未配置 Token 为本地演示模式。
-- `tasks.py`：任务记录 CRUD、`find_task_by_idempotency_key()` 与 JSON 字段序列化；`submitted_by` 记录提交人（鉴权开启时来自 agent 身份）。
+- `api.py`：操作接口 `POST /tasks`（支持 `Idempotency-Key`，冲突返回 `IDEMPOTENCY_CONFLICT`；需 agent）、`POST /approvals/{approval_id}/decision`（可带 `decided_by`；需 operator）、`POST /approvals/{approval_id}/abandon`（需 operator）、`POST /tasks/{task_id}/mapping`、`POST /tasks/{task_id}/recover`（需 operator）、`POST /reservations/gc`（需 operator，只释放审批不可再发布的预留）；只读接口 `GET /tasks`、`GET /tasks/{id}`、`GET /tasks/{id}/events`、`GET /recovery`、`GET /reservations`、`GET /healthz`（任一存储不可读或工具客户端不可用时 503 + `degraded`）、`GET /approvals`、`GET /approvals/{id}`、`GET /approvals/queue`（联表返回商品与任务上下文）；`GET /metrics` 输出 Prometheus 文本（不鉴权，供抓取）。lifespan 启动并停止通知 outbox worker（无 `ToolClient`）。配置 Token 后 `decided_by` / `abandoned_by` 以身份为准，忽略请求体；未配置 Token 为本地演示模式。
+- `tasks.py`：任务记录 CRUD、`find_task_by_idempotency_key()` 与 JSON 字段序列化；`submitted_by` 记录提交人（鉴权开启时来自 agent 身份）。`update_task()` 在同一事务内调用 `notifications.enqueue_terminal()`，保证终态与通知事件原子落库。
 - `demo.py`：一条命令启动演示（`python -m stock_pilot.demo`，也可用 `stock-pilot-demo`）。预检端口，打印审批台地址、各存储路径与三个演示 SKU；`--split` 以子进程拉起库存/商城 HTTP MCP Server、切到 `mcp-http` 并启用三库布局，退出时回收子进程；`--fresh` 只删除配置的演示库（含三个库的 `-wal`/`-shm`）。
 - `static/`：零构建的原生 HTML/CSS/JS 审批台，`GET /` 返回页面。页面每 5 秒自动刷新，审批备注草稿、映射选择与审批人姓名在重绘时保留；拒绝必须填写原因；存在异常态任务时显示「待恢复任务」面板，`published_verify_pending` 可补核对，`staging_orphaned` 提供「撤回遗留提案」按钮，`reservation_orphaned` / `reservation_stale` 提供「释放遗留预留」按钮（调用 `POST /reservations/gc`）。静态资源通过 `pyproject.toml` 的 `package-data` 打进 wheel。
 
@@ -213,6 +215,7 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 - `tests/test_reconnect.py`：HTTP MCP Server 停机后任务安全中止、同端口重启后客户端自动重连、新任务完成，且审计中只有一次成功 `publish_listing`（写不重放）。
 - `tests/test_split_stores.py`：三库各自只拥有本模块表；库存预留的独占/幂等/释放；split happy path 提交并释放预留；商城已提交但响应丢失时只读采纳一次（`publish_calls == 1`）；提交前失败则 `ABORTED_UNKNOWN_STATE` 并释放预留；split API 跨库读审批与指标；HTTP 两服务路由内部预留工具。
 - `tests/test_reservations.py`：`disposition()` 保守规则；预留输出带 TTL；清理释放 consumed / abandoned / 审批缺失 / 任务终态的预留且幂等；活跃审批的预留即使超过 TTL 也只标记 stale，清理后仍能正常发布；恢复扫描与指标；`POST /reservations/gc` 的 operator 鉴权。
+- `tests/test_outbox.py`：终态更新与通知在同一事务（入队失败回滚任务）、非终态不入队、重复终态去重、投递一次、发送失败保留待重试、`stock_pilot_outbox_pending`、API lifespan worker 端到端投递，以及 worker 零工具写入。
 - `tests/helpers.py`：进程内 uvicorn ServerHandle、空闲端口、`wait_until`，供 HTTP MCP、重连与 split 测试共用。
 - `tests/test_demo.py`：`stock_pilot.demo` 参数、端口探测，以及真实子进程启动后 `/healthz` 与页面可用。
 
@@ -222,8 +225,8 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 - `docs/demo.md`：面试演示脚本（含失败路径、恢复、拆分、鉴权与预留清理）。
 - `docs/observability.md`：指标清单、Prometheus 告警规则示例、JSON 日志字段、断线重连语义。
 - `docs/screenshots/console.png`：审批台截图，README 首屏引用。
-- `docs/adr/`：0001 两阶段审批提交、0002 失败即停止写、0003 拆分与静态 Token、0004 恢复与人工清理、0005 三库分离与发布 saga、0006 预留 TTL 与清理。
+- `docs/adr/`：0001 两阶段审批提交、0002 失败即停止写、0003 拆分与静态 Token、0004 恢复与人工清理、0005 三库分离与发布 saga、0006 预留 TTL 与清理、0007 通知 outbox。
 
 ## 实现状态
 
-工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复（含已提交任务补核对）、任务/审批幂等、工具调用审计、发布前与提交事务内库存复核、遗留提案人工清理、健康检查均已落地；B1 已完成库存/商城两个 Streamable HTTP MCP Server 与静态 Token 角色鉴权；任务、审批、撤回分别留痕提交人 / 审批人 / 撤回人；E1 并发不变量与 E2 观测性（Prometheus 指标、JSON 日志、断线自动重连）已完成。E4 提供一条命令的演示启动器与审批台截图。E3 完成三库分离与发布 saga：内部 `reserve_inventory` / `release_inventory`、提交后响应丢失的只读采纳、跨库恢复扫描与指标、`demo --split`。E5 完成预留 TTL 观测与保守清理：`list_reservations`、`GET/POST /reservations`、恢复扫描分类、指标与审批台按钮。`pytest -q` 当前 112 个用例通过（含并发不变量；并发用例连续 20 次全绿），`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。尚未实现：预留清理的进程内定时调度（当前由 operator 或外部 cron 触发）、通知类 outbox（不重投写）、OIDC / 真实登录、指标接入告警平台与日志聚合、Postgres。
+工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复（含已提交任务补核对）、任务/审批幂等、工具调用审计、发布前与提交事务内库存复核、遗留提案人工清理、健康检查均已落地；B1 已完成库存/商城两个 Streamable HTTP MCP Server 与静态 Token 角色鉴权；任务、审批、撤回分别留痕提交人 / 审批人 / 撤回人；E1 并发不变量与 E2 观测性（Prometheus 指标、JSON 日志、断线自动重连）已完成。E4 提供一条命令的演示启动器与审批台截图。E3 完成三库分离与发布 saga：内部 `reserve_inventory` / `release_inventory`、提交后响应丢失的只读采纳、跨库恢复扫描与指标、`demo --split`。E5 完成预留 TTL 观测与保守清理：`list_reservations`、`GET/POST /reservations`、恢复扫描分类、指标与审批台按钮。P2 完成仅通知 outbox：终态同事务入队、至少一次投递、`stock_pilot_outbox_pending`、lifespan worker，结构上禁止重投写。`pytest -q` 当前 120 个用例通过（含并发不变量；并发用例连续 20 次全绿），`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。尚未实现：预留清理的进程内定时调度（当前由 operator 或外部 cron 触发）、外部 webhook 通知适配器与 outbox 死信/保留清理、OIDC / 真实登录、指标接入告警平台与日志聚合、Postgres。

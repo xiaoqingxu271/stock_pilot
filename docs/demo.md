@@ -5,7 +5,7 @@
 ## 0. 启动（30 秒）
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q               # 112 passed
+./.venv/Scripts/python.exe -m pytest -q               # 120 passed
 ./.venv/Scripts/python.exe -m ruff check src tests
 ./.venv/Scripts/python.exe -m stock_pilot.demo        # http://127.0.0.1:8000/
 # --split 同时拉起两个 HTTP MCP Server 并拆成三个库；--fresh 只重建配置的演示库

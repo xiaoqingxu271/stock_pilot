@@ -30,6 +30,9 @@ class Settings:
     # operator. It never triggers an automatic release: an approved proposal
     # may still be about to publish.
     reservation_ttl_seconds: int = 900
+    # Notification outbox worker poll interval. Delivery is at least once and
+    # never re-drives a tool write.
+    outbox_interval_seconds: float = 2.0
     # Production split: two HTTP MCP servers over a shared demo database.
     inventory_mcp_url: str = "http://127.0.0.1:8101/mcp"
     mall_mcp_url: str = "http://127.0.0.1:8102/mcp"
@@ -49,6 +52,8 @@ class Settings:
             )
         if self.reservation_ttl_seconds <= 0:
             raise ValueError("reservation_ttl_seconds must be positive")
+        if self.outbox_interval_seconds <= 0:
+            raise ValueError("outbox_interval_seconds must be positive")
 
     @property
     def split_stores(self) -> bool:
@@ -96,6 +101,9 @@ class Settings:
             ),
             reservation_ttl_seconds=int(
                 os.environ.get("STOCK_PILOT_RESERVATION_TTL", "900")
+            ),
+            outbox_interval_seconds=float(
+                os.environ.get("STOCK_PILOT_OUTBOX_INTERVAL", "2")
             ),
             inventory_mcp_url=os.environ.get(
                 "STOCK_PILOT_INVENTORY_URL", "http://127.0.0.1:8101/mcp"

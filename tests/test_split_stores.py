@@ -132,6 +132,7 @@ def test_each_store_owns_only_its_tables(split_settings: Settings):
     assert table_names(split_settings.store_orchestrator) == {
         "tasks",
         "tool_events",
+        "outbox_events",
         "sqlite_sequence",
     }
     assert table_names(split_settings.store_inventory) == {"inventory_records"}

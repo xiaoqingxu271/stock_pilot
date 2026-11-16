@@ -110,6 +110,23 @@ CREATE TABLE IF NOT EXISTS tool_events (
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tool_events_task ON tool_events(task_id, id);
+
+-- Notification-only outbox. Rows are enqueued in the same transaction as the
+-- terminal task update and delivered at least once by a worker that has no
+-- access to the tool client. It must never re-drive a write operation.
+CREATE TABLE IF NOT EXISTS outbox_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedupe_key    TEXT NOT NULL UNIQUE,
+    topic         TEXT NOT NULL,
+    task_id       TEXT,
+    payload_json  TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    delivered_at  TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_pending
+    ON outbox_events(id) WHERE delivered_at IS NULL;
 """
 
 SCHEMA = INVENTORY_SCHEMA + MALL_SCHEMA + ORCHESTRATOR_SCHEMA

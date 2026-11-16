@@ -105,6 +105,12 @@ class ReservationGcAction(str, Enum):
     FAILED = "failed"
 
 
+class NotificationTopic(str, Enum):
+    """Outbox topics. Notification-only: never a write-command queue."""
+
+    TASK_TERMINAL = "task.terminal"
+
+
 class ToolOutcome(str, Enum):
     OK = "ok"
     BUSINESS_ERROR = "business_error"

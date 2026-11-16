@@ -48,6 +48,7 @@ curl -s -X POST localhost:8000/reservations/gc   # operator 清理（无 Token �
 | 商城已提交但响应丢失 | 只读对账发现已按目标价上架则采纳并核对，审批已消费；不会第二次调用 `publish_listing` |
 | 拆分存储下的提交期库存 | 复核后先预留库存，失败则撤回提案、商城零写入；提交后尽力释放预留 |
 | 预留后进程崩溃 | 恢复扫描报 `reservation_orphaned`；`POST /reservations/gc` 只释放审批已终止/缺失或任务终态的预留，活跃审批的预留不自动释放 |
+| 终态通知 | 任务终态与 `outbox_events` 同一事务写入；worker 至少一次投递，但结构上不持有工具客户端，**不重投任何写操作** |
 | 进程中断 | 重启后 `GET /recovery` 显式列出异常态；已审批提案可安全恢复，未审批任务沿用原流程 |
 | 重复请求 | `Idempotency-Key` 保证 `POST /tasks` 不重复建任务；重复审批返回当前结果 |
 | 操作人身份 | 配置 Token 后写接口按角色校验；`decided_by` / `abandoned_by` 取自身份，不信任请求体 |
@@ -103,6 +104,8 @@ curl -s -X POST localhost:8000/reservations/gc   # operator 清理（无 Token �
 **拆分存储与发布 saga（E3）**：`split` 布局把库存、商城（含审批）与编排任务拆成三个库。商城库看不到库存表，因此发布链路改为 saga：复核库存 → 通过内部工具 `reserve_inventory` 预留 → `publish_listing` 在商城事务内提交并消费审批 → 回写任务 → 尽力释放预留。商城提交后响应丢失时，只做一次只读 `get_listing`：已按目标价上架就采纳并核对，绝不重发写操作；未提交则任务 `ABORTED_UNKNOWN_STATE` 并释放预留，staging 留给恢复面板人工撤回。补偿只撤回未提交的提案或释放预留，不会回滚已提交的商城事实；这里刻意不引入会重投写操作的 outbox。取舍与失败矩阵见 `docs/adr/0005-split-stores-and-publish-saga.md`。
 
 **预留 TTL 与清理（E5）**：`release_inventory` 是尽力补偿，进程若在预留后崩溃，库存会被长期占用。系统提供只读 `GET /reservations` 与 operator 触发的 `POST /reservations/gc`：清理只释放审批已 `consumed` / `rejected` / `abandoned`、审批缺失或任务已终态的预留；审批仍可发布且任务活跃的预留**绝不自动释放**。`STOCK_PILOT_RESERVATION_TTL`（默认 900 秒）只用于把超龄预留标记为 `reservation_stale` 并报警，不构成释放许可。`GET /recovery` 与审批台会显示 `reservation_orphaned` / `reservation_stale`，面板提供「释放遗留预留」按钮。设计见 `docs/adr/0006-reservation-ttl-and-gc.md`。
+
+**仅通知 outbox（P2）**：任务进入终态时，`tasks` 更新与 `outbox_events` 在**同一事务**落库，`dedupe_key` 防止重复。API lifespan 启动的后台 worker 只持有数据库路径与 `NotificationSender`（默认写结构化日志），按至少一次投递；发送失败保留 pending 并累计 `attempts` / `last_error`。它**不持有任何工具客户端**，所以结构上不可能重放 `publish_listing` 或 `update_price`——与 ADR 0005 的「不确定即停写」一致。指标 `stock_pilot_outbox_pending` 暴露积压。设计见 `docs/adr/0007-notification-outbox.md`。
 
 **发布前复核**：审批可能持续数小时，库存不是审批时的快照。图在 `await_approval` 与 `publish` 之间增加 `recheck_stock`：库存不足、记录消失或复核工具失败时，系统不提交，而是把审批标记为 `abandoned` 并在同一事务里丢弃 staging；任务进入 `ROLLED_BACK`（库存不足）或 `ABORTED_UNKNOWN_STATE`（无法确认）。`abandoned` 不是人工拒绝，审计上区分开。
 
@@ -196,7 +199,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 112 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 120 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -215,6 +218,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_reconnect.py`：HTTP MCP Server 停机 → 任务安全中止 → 同端口重启 → 自动重连 → 新任务完成，审计中只有一次成功 `publish_listing`。
 - `tests/test_split_stores.py`：三库隔离、预留互斥/幂等/释放、拆分 API 与指标跨库读取、MCP 预留工具路由，以及「商城已提交但响应丢失」时只读采纳且不重发写。
 - `tests/test_reservations.py`：清理只释放审批终止/缺失/任务终态的预留；活跃审批的预留即使超过 TTL 也只标记 stale 且仍能完成发布；清理幂等、operator 鉴权、恢复扫描与指标。
+- `tests/test_outbox.py`：终态与通知同事务、入队失败回滚任务、重复终态去重、至少一次投递与失败重试、pending 指标、lifespan worker，以及零工具写入。
 
 ## 目录
 
@@ -250,7 +254,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 - `docs/demo.md`：约 8 分钟的面试演示脚本，含失败路径与拆分/鉴权演示。
 - `docs/screenshots/console.png`：审批台截图（演示数据：待审批 / 映射歧义 / 已核对 / 库存终止）。
 - `docs/observability.md`：指标、告警规则、结构化日志与断线重连语义。
-- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理、三库与发布 saga、预留 TTL 与清理的决策记录。
+- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理、三库与发布 saga、预留 TTL 与清理、通知 outbox 的决策记录。
 
 ## 设计取舍与生产化
 
@@ -259,7 +263,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 生产化继续方向：
 
 1. 预留清理已由 operator 触发；生产可按 TTL 定时调度 `POST /reservations/gc`，并接入告警。
-2. Postgres 替换 SQLite；通知类事件可引入 outbox，但写操作仍不得重投。
+2. Postgres 替换 SQLite；通知 outbox 已落地，生产再补外部 webhook 发送器、死信与保留清理。
 3. 静态 Token 换成 OIDC / 真实登录；只读鉴权已可通过 `STOCK_PILOT_REQUIRE_READ_AUTH` 开启，生产再接入统一网关。
 4. 指标与结构化日志已落地（Prometheus `/metrics`、JSON 日志）；生产再接入告警平台、日志聚合与审批审计导出。
 

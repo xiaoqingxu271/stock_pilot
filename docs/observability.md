@@ -17,6 +17,7 @@ StockPilot 的观测面全部从权威状态派生：任务与工具时间线来
 | `stock_pilot_recovery_issues` | gauge | — | 需要人工关注的中断态任务 + 遗留 staging + 遗留预留 |
 | `stock_pilot_reservations_open` | gauge | — | 当前被发布预留占用的库存记录数 |
 | `stock_pilot_reservations_stale` | gauge | — | 存活超过 `STOCK_PILOT_RESERVATION_TTL` 的活跃预留数 |
+| `stock_pilot_outbox_pending` | gauge | — | 尚未投递的通知事件数 |
 | `stock_pilot_circuit_open` | gauge | `tool` | 熔断器当前是否拒绝调用（1/0） |
 | `stock_pilot_tool_client_available` | gauge | — | 工具客户端是否持有可用会话（1/0） |
 
@@ -27,6 +28,11 @@ MCP 模式下，工具服务端也会把尝试写入共享演示库；服务端�
 预留计数在 `inventory.db`；collector 分别读取三个库再组装，不需要跨库 SQL。
 `stock_pilot_reservations_stale` 只说明预留超过 TTL，**不表示可以强制释放**：
 审批仍可发布的预留由清理接口保留，详见 `docs/adr/0006`。
+
+`stock_pilot_outbox_pending` 长期大于 0 说明通知发送器持续失败或 worker 未运行。
+投递是至少一次语义，崩溃可能在发送后、标记前重放一条通知；消费方按
+`dedupe_key` 去重。worker 不持有工具客户端，**不会重投任何写操作**，详见
+`docs/adr/0007`。
 
 `GET /healthz` 与指标同源：数据库不可读或工具客户端不可用时返回 `503` 与
 `status=degraded`，同时暴露 `pending_approvals`、`recovery_issues`。
@@ -90,6 +96,13 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: 活跃库存预留超过 TTL，核查任务状态后再决定是否清理
+
+      - alert: StockPilotOutboxBacklog
+        expr: stock_pilot_outbox_pending > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: 通知事件持续未投递，检查 outbox worker 与发送器
 ```
 
 超时率分母为 0 时比值不产生样本，规则自然不会触发。熔断告警只说明调用被

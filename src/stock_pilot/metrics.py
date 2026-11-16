@@ -16,7 +16,7 @@ from prometheus_client.core import (
     HistogramMetricFamily,
 )
 
-from stock_pilot import recovery
+from stock_pilot import notifications, recovery
 from stock_pilot.db import connect
 from stock_pilot.enums import RecoveryKind
 
@@ -112,6 +112,11 @@ class StockPilotCollector:
             "stock_pilot_reservations_stale",
             "Active reservations beyond the advisory TTL.",
             reservations_stale,
+        )
+        yield self._gauge(
+            "stock_pilot_outbox_pending",
+            "Notification events not yet delivered.",
+            notifications.pending_count(self.db_path),
         )
         yield self._circuits()
         yield self._gauge(
