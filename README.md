@@ -36,6 +36,8 @@ check_inventory → get_listing → update_price（审批）
 | 写操作必须审批 | `update_price` 只写 staging + 审批记录；商城公开价格在审批通过前不变 |
 | 审批拒绝零残留 | 拒绝时丢弃 staging；商城侧从未发生写入 |
 | 写超时 | 只做一次只读 `get_listing` 对账；对账失败进入 `ABORTED_UNKNOWN_STATE`，绝不重发写操作 |
+| 商城已提交但响应丢失 | 只读对账发现已按目标价上架则采纳并核对，审批已消费；不会第二次调用 `publish_listing` |
+| 拆分存储下的提交期库存 | 复核后先预留库存，失败则撤回提案、商城零写入；提交后尽力释放预留 |
 | 进程中断 | 重启后 `GET /recovery` 显式列出异常态；已审批提案可安全恢复，未审批任务沿用原流程 |
 | 重复请求 | `Idempotency-Key` 保证 `POST /tasks` 不重复建任务；重复审批返回当前结果 |
 | 操作人身份 | 配置 Token 后写接口按角色校验；`decided_by` / `abandoned_by` 取自身份，不信任请求体 |
@@ -68,23 +70,27 @@ check_inventory → get_listing → update_price（审批）
                                    │ MCP
                     ┌──────────────▼───────────────┐
                     │ MCP Server（4 个工具）         │
+                    │ split 另挂内部库存预留工具     │
                     └──────────────┬───────────────┘
                                    │
                     ┌──────────────▼───────────────┐
                     │ SQLite（WAL）                 │
-                    │ inventory / listings /        │
-                    │ staging / approvals / tasks   │
+                    │ 默认单库；split 三库隔离       │
+                    │ inventory / mall / orchestr.  │
                     └──────────────────────────────┘
 ```
 
 - `STOCK_PILOT_TOOL_CLIENT=inprocess`（默认）：工具在编排进程内执行，便于测试。
 - `STOCK_PILOT_TOOL_CLIENT=mcp`：四个工具真实走 MCP stdio，客户端自动拉起 Server 子进程。
 - `STOCK_PILOT_TOOL_CLIENT=mcp-http`：库存与商城拆成两个独立 MCP Server（Streamable HTTP），客户端按工具路由到对应服务，携带 `STOCK_PILOT_AGENT_TOKEN`。
+- `STOCK_PILOT_DB_LAYOUT=split`：库存 / 商城（含审批）/ 编排各用一个 SQLite 文件；不设置时仍是单库演示。`stock_pilot.demo --split` 会同时启用拆分拓扑与三库。
 - 审批队列读写与决策留在编排进程本地，因为审批台是人机管理面，不属于四个 MCP 工具。
 
 **鉴权（B1）**：`STOCK_PILOT_AGENT_TOKEN` / `STOCK_PILOT_OPERATOR_TOKEN` / `STOCK_PILOT_ADMIN_TOKEN` 配置静态 Bearer Token。任一 Token 存在即启用校验：提交任务需 agent（admin 亦可），审批、映射确认、恢复、撤回需 operator（admin 亦可）；带身份时 `decided_by` / `abandoned_by` 取自身份，忽略请求体伪装。只读接口默认保持开放以便演示；设置 `STOCK_PILOT_REQUIRE_READ_AUTH=true` 后，`GET /tasks|/approvals|/recovery` 也要求任一有效 Token（`/healthz` 始终开放供探针使用）。两个 HTTP MCP Server 同样只接受 agent Token。审批台的「管理令牌」输入框会附带 Bearer 头（存于 sessionStorage，关闭标签页即失效），填入 admin Token 即可在启用鉴权时操作全流程。未配置任何 Token 时保持本地演示模式。
 
 **两阶段提交**：`update_price` 在同一事务里写 `staging` 和 `approvals`，商城不可见；审批通过后 `publish_listing` 在同一事务内完成「改价 + 上架 + 消费审批」。因此不存在「价格已改但未上架」的中间脏状态。
+
+**拆分存储与发布 saga（E3）**：`split` 布局把库存、商城（含审批）与编排任务拆成三个库。商城库看不到库存表，因此发布链路改为 saga：复核库存 → 通过内部工具 `reserve_inventory` 预留 → `publish_listing` 在商城事务内提交并消费审批 → 回写任务 → 尽力释放预留。商城提交后响应丢失时，只做一次只读 `get_listing`：已按目标价上架就采纳并核对，绝不重发写操作；未提交则任务 `ABORTED_UNKNOWN_STATE` 并释放预留，staging 留给恢复面板人工撤回。补偿只撤回未提交的提案或释放预留，不会回滚已提交的商城事实；这里刻意不引入会重投写操作的 outbox。取舍与失败矩阵见 `docs/adr/0005-split-stores-and-publish-saga.md`。
 
 **发布前复核**：审批可能持续数小时，库存不是审批时的快照。图在 `await_approval` 与 `publish` 之间增加 `recheck_stock`：库存不足、记录消失或复核工具失败时，系统不提交，而是把审批标记为 `abandoned` 并在同一事务里丢弃 staging；任务进入 `ROLLED_BACK`（库存不足）或 `ABORTED_UNKNOWN_STATE`（无法确认）。`abandoned` 不是人工拒绝，审计上区分开。
 
@@ -104,7 +110,7 @@ python -m venv .venv
 
 # 一条命令：建库 + 启动审批台（默认进程内模式）
 ./.venv/Scripts/python.exe -m stock_pilot.demo
-# 浏览器打开 http://127.0.0.1:8000/；加 --split 使用两个 HTTP MCP Server
+# 浏览器打开 http://127.0.0.1:8000/；加 --split 使用两个 HTTP MCP Server 与三库
 
 # 只启动 API
 ./.venv/Scripts/python.exe -m stock_pilot.api
@@ -178,7 +184,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 93 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 100 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -195,6 +201,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_recovery.py`：进程重启、幂等提交、审批幂等、操作者身份、工具时间线、恢复接口（含已提交任务只读核对）、发布前与事务内库存复核、遗留提案撤回。
 - `tests/test_observability.py`：`/metrics` 数值（任务、工具事件、耗时、熔断、降级）、JSON 日志字段与 `task_id`、白名单（Token 不入日志）、`/healthz` 降级。
 - `tests/test_reconnect.py`：HTTP MCP Server 停机 → 任务安全中止 → 同端口重启 → 自动重连 → 新任务完成，审计中只有一次成功 `publish_listing`。
+- `tests/test_split_stores.py`：三库隔离、预留互斥/幂等/释放、拆分 API 与指标跨库读取、MCP 预留工具路由，以及「商城已提交但响应丢失」时只读采纳且不重发写。
 
 ## 目录
 
@@ -229,17 +236,17 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 - `docs/demo.md`：约 8 分钟的面试演示脚本，含失败路径与拆分/鉴权演示。
 - `docs/screenshots/console.png`：审批台截图（演示数据：待审批 / 映射歧义 / 已核对 / 库存终止）。
 - `docs/observability.md`：指标、告警规则、结构化日志与断线重连语义。
-- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理的决策记录。
+- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理、三库与发布 saga 的决策记录。
 
 ## 设计取舍与生产化
 
-第一版刻意保持单 SQLite、单 MCP Server，用 module 边界隔离库存 / 商城 / 审批，便于在本地演示完整闭环和故障路径。B1 已把库存与商城拆成两个独立的 Streamable HTTP MCP Server，并加上静态 Token 角色鉴权；审批面按决策留在编排进程，因为它是人机管理面而非模型工具。
+第一版刻意保持单 SQLite、单 MCP Server，用 module 边界隔离库存 / 商城 / 审批，便于在本地演示完整闭环和故障路径。B1 把库存与商城拆成两个独立的 Streamable HTTP MCP Server 并加上静态 Token 角色鉴权；审批面留在编排进程，因为它是人机管理面而非模型工具。E3 在 `split` 布局下进一步做到三库隔离，用内部库存预留与只读对账替代跨库事务。
 
-生产化继续拆分方向：
+生产化继续方向：
 
-1. 两个工具 Server 各自持有独立数据库与服务间鉴权；当前演示仍共享同一个 SQLite 文件。
-2. Postgres 替换 SQLite；跨服务提交从单库事务改为 saga / 补偿，明确每一步的一致性边界。
+1. 库存预留增加 TTL 与回收任务，避免进程在预留后崩溃造成长期占用。
+2. Postgres 替换 SQLite；通知类事件可引入 outbox，但写操作仍不得重投。
 3. 静态 Token 换成 OIDC / 真实登录；只读鉴权已可通过 `STOCK_PILOT_REQUIRE_READ_AUTH` 开启，生产再接入统一网关。
 4. 指标与结构化日志已落地（Prometheus `/metrics`、JSON 日志）；生产再接入告警平台、日志聚合与审批审计导出。
 
-已知限制：共享 SQLite 适合单实例演示，拆分 Server 只是拓扑演练；静态 Token 没有轮换与细粒度权限；admin 自审只告警不阻断（正常流程由角色分离保证审批人 ≠ 提交人）。
+已知限制：SQLite 适合单实例演示；预留没有 TTL；静态 Token 没有轮换与细粒度权限；admin 自审只告警不阻断（正常流程由角色分离保证审批人 ≠ 提交人）。

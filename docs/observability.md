@@ -21,6 +21,9 @@ StockPilot 的观测面全部从权威状态派生：任务与工具时间线来
 MCP 模式下，工具服务端也会把尝试写入共享演示库；服务端行没有 `task_id`，
 因此指标只统计 `task_id IS NOT NULL` 的编排侧记录，避免双倍计数。
 
+`split` 布局下任务与工具事件在 `orchestrator.db`，审批在 `mall.db`；
+collector 分别读取两个库再组装，不需要跨库 SQL。
+
 `GET /healthz` 与指标同源：数据库不可读或工具客户端不可用时返回 `503` 与
 `status=degraded`，同时暴露 `pending_approvals`、`recovery_issues`。
 

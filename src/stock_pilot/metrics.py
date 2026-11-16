@@ -28,8 +28,11 @@ class StockPilotCollector:
         db_path: str,
         circuit_states: Callable[[], dict[str, bool]],
         tool_client_available: bool,
+        *,
+        mall_db_path: str | None = None,
     ) -> None:
         self.db_path = db_path
+        self.mall_db_path = mall_db_path or db_path
         self.circuit_states = circuit_states
         self.tool_client_available = tool_client_available
 
@@ -52,11 +55,16 @@ class StockPilotCollector:
                 "SELECT tool, latency_ms FROM tool_events"
                 " WHERE task_id IS NOT NULL"
             ).fetchall()
-            pending = conn.execute(
+        finally:
+            conn.close()
+
+        mall_conn = connect(self.mall_db_path)
+        try:
+            pending = mall_conn.execute(
                 "SELECT COUNT(*) AS n FROM approvals WHERE status = 'pending'"
             ).fetchone()["n"]
         finally:
-            conn.close()
+            mall_conn.close()
 
         yield self._tasks(task_rows)
         yield self._events(event_rows)
@@ -69,7 +77,11 @@ class StockPilotCollector:
         yield self._gauge(
             "stock_pilot_recovery_issues",
             "Non-terminal tasks or orphaned staging rows needing attention.",
-            len(recovery.scan(self.db_path)),
+            len(
+                recovery.scan(
+                    self.db_path, mall_db_path=self.mall_db_path
+                )
+            ),
         )
         yield self._circuits()
         yield self._gauge(
@@ -140,12 +152,18 @@ class StockPilotCollector:
 def render_metrics(
     db_path: str,
     *,
+    mall_db_path: str | None = None,
     circuit_states: dict[str, bool] | None = None,
     tool_client_available: bool = True,
 ) -> bytes:
     states = circuit_states or {}
     registry = CollectorRegistry(auto_describe=True)
     registry.register(
-        StockPilotCollector(db_path, lambda: states, tool_client_available)
+        StockPilotCollector(
+            db_path,
+            lambda: states,
+            tool_client_available,
+            mall_db_path=mall_db_path,
+        )
     )
     return generate_latest(registry)

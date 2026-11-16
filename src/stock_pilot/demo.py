@@ -18,7 +18,7 @@ from pathlib import Path
 
 import uvicorn
 
-from stock_pilot.config import DEFAULT_DB_PATH, PROJECT_ROOT
+from stock_pilot.config import DEFAULT_DB_PATH, PROJECT_ROOT, Settings
 
 _CHECKS = (
     ("正常调价", "SKU-TSHIRT-001", "白色-M", "59.00", "审批通过 → 已上架"),
@@ -51,7 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split",
         action="store_true",
-        help="start inventory + mall HTTP MCP servers and route tools to them",
+        help=(
+            "start inventory + mall HTTP MCP servers, route tools to them, "
+            "and split inventory / mall / orchestrator data into three DBs"
+        ),
     )
     parser.add_argument(
         "--fresh",
@@ -87,9 +90,18 @@ def _child_env(db_path: str) -> dict[str, str]:
     return env
 
 
-def _clear_demo_db(db_path: str) -> None:
-    for suffix in ("", "-wal", "-shm"):
-        Path(f"{db_path}{suffix}").unlink(missing_ok=True)
+def _store_paths(db_path: str, split: bool) -> list[str]:
+    settings = Settings(db_path=db_path, db_layout="split" if split else "shared")
+    paths = [settings.store_orchestrator]
+    if split:
+        paths.extend([settings.store_inventory, settings.store_mall])
+    return list(dict.fromkeys(paths))
+
+
+def _clear_demo_db(paths: list[str]) -> None:
+    for db_path in paths:
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{db_path}{suffix}").unlink(missing_ok=True)
 
 
 def _start_split_servers(
@@ -132,13 +144,21 @@ def _stop(processes: list[subprocess.Popen]) -> None:
 
 
 def _banner(
-    host: str, port: int, db_path: str, split: bool, fresh: bool
+    host: str, port: int, paths: list[str], split: bool, fresh: bool
 ) -> None:
     shown_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     print()
     print("StockPilot 审批台：" f"http://{shown_host}:{port}/")
-    print(f"数据库：{db_path}" + ("（已重建）" if fresh else ""))
-    print(f"工具拓扑：{'库存 / 商城两个 HTTP MCP Server' if split else '进程内'}")
+    label = "（已重建）" if fresh else ""
+    print(f"数据库：{', '.join(paths)}{label}")
+    print(
+        "工具拓扑："
+        + (
+            "库存 / 商城两个 HTTP MCP Server，三库分离"
+            if split
+            else "进程内，单库"
+        )
+    )
     print()
     print("演示用例：")
     for name, sku, spec, price, outcome in _CHECKS:
@@ -160,10 +180,12 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     os.environ["STOCK_PILOT_DB"] = db_path
+    os.environ["STOCK_PILOT_DB_LAYOUT"] = "split" if args.split else "shared"
     os.environ["STOCK_PILOT_HOST"] = host
     os.environ["STOCK_PILOT_PORT"] = str(port)
+    paths = _store_paths(db_path, args.split)
     if args.fresh:
-        _clear_demo_db(db_path)
+        _clear_demo_db(paths)
 
     inventory_port = int(os.environ.get("STOCK_PILOT_INVENTORY_PORT", "8101"))
     mall_port = int(os.environ.get("STOCK_PILOT_MALL_PORT", "8102"))
@@ -183,7 +205,7 @@ def main(argv: list[str] | None = None) -> None:
         else:
             os.environ["STOCK_PILOT_TOOL_CLIENT"] = "inprocess"
 
-        _banner(host, port, db_path, args.split, args.fresh)
+        _banner(host, port, paths, args.split, args.fresh)
         uvicorn.run(
             "stock_pilot.api:create_app",
             factory=True,

@@ -193,9 +193,18 @@ def update_price(db_path: str, request: UpdatePriceInput) -> UpdatePriceOutput:
 
 
 def publish_listing(
-    db_path: str, request: PublishListingInput
+    db_path: str,
+    request: PublishListingInput,
+    *,
+    check_stock: bool = True,
 ) -> PublishListingOutput:
-    """Atomically commit the staged price and publish the listing."""
+    """Atomically commit the staged price and publish the listing.
+
+    ``check_stock`` is the shared-store defence against a depleted row at
+    commit time. In split stores the mall owns no inventory data; the
+    orchestrator holds a reservation on the inventory service instead, and
+    passes ``check_stock=False`` (see ADR 0005).
+    """
     now = iso(utcnow())
 
     with transaction(db_path) as tx:
@@ -265,21 +274,21 @@ def publish_listing(
 
         # Last line of defence against the recheck/commit race: inventory can
         # still change between the agent's read-only recheck and this commit.
-        # In the split production topology this becomes a stock reservation.
-        inventory = tx.execute(
-            "SELECT quantity FROM inventory_records WHERE id = ?",
-            (listing["inventory_record_id"],),
-        ).fetchone()
-        if inventory is None:
-            raise ToolFailure(
-                ErrorCode.INVENTORY_NOT_FOUND,
-                "inventory record disappeared before commit",
-            )
-        if inventory["quantity"] <= 0:
-            raise ToolFailure(
-                ErrorCode.INSUFFICIENT_STOCK,
-                "inventory is depleted at commit time",
-            )
+        if check_stock:
+            inventory = tx.execute(
+                "SELECT quantity FROM inventory_records WHERE id = ?",
+                (listing["inventory_record_id"],),
+            ).fetchone()
+            if inventory is None:
+                raise ToolFailure(
+                    ErrorCode.INVENTORY_NOT_FOUND,
+                    "inventory record disappeared before commit",
+                )
+            if inventory["quantity"] <= 0:
+                raise ToolFailure(
+                    ErrorCode.INSUFFICIENT_STOCK,
+                    "inventory is depleted at commit time",
+                )
 
         tx.execute(
             "UPDATE listings SET price_cents = ?, status = ?, updated_at = ?"

@@ -79,6 +79,17 @@ class PublishListingInput(StrictModel):
     approval_id: ShortText
 
 
+class ReserveInventoryInput(StrictModel):
+    """Internal saga step; not part of the four model-facing tools."""
+
+    inventory_record_id: ShortText
+    approval_id: ShortText
+
+
+class ReleaseInventoryInput(StrictModel):
+    approval_id: ShortText
+
+
 # ---------------------------------------------------------------------------
 # Shared value objects
 # ---------------------------------------------------------------------------
@@ -205,6 +216,18 @@ class PublishListingOutput(ToolOutput):
     final_status: ListingStatus | None = None
     final_price: Money | None = None
     committed_at: datetime | None = None
+
+
+class ReserveInventoryOutput(ToolOutput):
+    inventory_record_id: str | None = None
+    approval_id: str | None = None
+    quantity: int | None = None
+    reserved: bool = False
+
+
+class ReleaseInventoryOutput(ToolOutput):
+    approval_id: str | None = None
+    released: bool = False
 
 
 # ---------------------------------------------------------------------------

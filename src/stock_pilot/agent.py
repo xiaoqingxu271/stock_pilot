@@ -37,6 +37,8 @@ from stock_pilot.models import (
     CreateTaskRequest,
     GetListingInput,
     PublishListingInput,
+    ReleaseInventoryInput,
+    ReserveInventoryInput,
     TaskVerification,
     TaskView,
     UpdatePriceInput,
@@ -415,6 +417,21 @@ def build_graph(
             )
         return None
 
+    def _release_reservation(state: AgentState) -> None:
+        """Best-effort compensation; a leak only blocks other proposals."""
+        if not client.settings.split_stores:
+            return
+        try:
+            client.release_inventory(
+                ReleaseInventoryInput(approval_id=state["approval_id"])
+            )
+        except Exception:  # noqa: BLE001 - never fail the task on cleanup
+            logger.warning(
+                "failed to release stock reservation for approval %s",
+                state.get("approval_id"),
+                exc_info=True,
+            )
+
     def recheck_stock(state: AgentState) -> dict[str, Any]:
         """A point-in-time stock check immediately before the commit."""
         result = client.check_inventory(
@@ -445,6 +462,36 @@ def build_graph(
                 state, TaskStatus.ROLLED_BACK, ErrorCode.INSUFFICIENT_STOCK
             )
 
+        if client.settings.split_stores:
+            # The mall owns no inventory data, so the commit-time gate becomes
+            # a reservation held across the recheck-to-commit window.
+            reserved = client.reserve_inventory(
+                ReserveInventoryInput(
+                    inventory_record_id=state["inventory_record_id"],
+                    approval_id=state["approval_id"],
+                )
+            )
+            if not reserved.ok or not reserved.reserved:
+                code = reserved.error_code or ErrorCode.STOCK_RESERVED
+                failure = _abandon_proposal(
+                    state, f"库存预留失败：{code.value}，系统撤回提案"
+                )
+                _release_reservation(state)
+                if failure is not None:
+                    return failure
+                if code in (
+                    ErrorCode.INSUFFICIENT_STOCK,
+                    ErrorCode.STOCK_RESERVED,
+                ):
+                    return finish(state, TaskStatus.ROLLED_BACK, code)
+                if code is ErrorCode.INVENTORY_NOT_FOUND:
+                    return finish(
+                        state, TaskStatus.ABORTED_NOT_FOUND, code
+                    )
+                return finish(
+                    state, TaskStatus.ABORTED_UNKNOWN_STATE, code
+                )
+
         return {}
 
     def route_after_recheck(state: AgentState) -> str:
@@ -453,6 +500,12 @@ def build_graph(
     # -- 6. atomic publish ------------------------------------------------
 
     def publish(state: AgentState) -> dict[str, Any]:
+        try:
+            return _publish(state)
+        finally:
+            _release_reservation(state)
+
+    def _publish(state: AgentState) -> dict[str, Any]:
         result = client.publish_listing(
             PublishListingInput(
                 listing_id=state["listing_id"],

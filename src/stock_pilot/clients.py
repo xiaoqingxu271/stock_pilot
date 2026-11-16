@@ -25,7 +25,7 @@ from mcp.client.stdio import stdio_client
 from stock_pilot import approval as approval_queue
 from stock_pilot.audit import make_event_sink
 from stock_pilot.config import PROJECT_ROOT, Settings
-from stock_pilot.db import initialize_database
+from stock_pilot.db import initialize_database, initialize_split_stores
 from stock_pilot.enums import ApprovalDecision, ErrorCode
 from stock_pilot.errors import (
     CircuitOpenError,
@@ -42,6 +42,10 @@ from stock_pilot.models import (
     GetListingOutput,
     PublishListingInput,
     PublishListingOutput,
+    ReleaseInventoryInput,
+    ReleaseInventoryOutput,
+    ReserveInventoryInput,
+    ReserveInventoryOutput,
     ToolOutput,
     UpdatePriceInput,
     UpdatePriceOutput,
@@ -67,6 +71,15 @@ class ToolClient(Protocol):
     def update_price(self, request: UpdatePriceInput) -> UpdatePriceOutput: ...
 
     def publish_listing(self, request: PublishListingInput) -> PublishListingOutput: ...
+
+    # Internal inventory saga (split-store deployment only).
+    def reserve_inventory(
+        self, request: ReserveInventoryInput
+    ) -> ReserveInventoryOutput: ...
+
+    def release_inventory(
+        self, request: ReleaseInventoryInput
+    ) -> ReleaseInventoryOutput: ...
 
     # Health probe used by readiness checks.
     def is_available(self) -> bool: ...
@@ -113,19 +126,30 @@ def create_tool_client(
     )
 
 
+def initialize_stores(settings: Settings) -> None:
+    if settings.split_stores:
+        initialize_split_stores(
+            inventory_db_path=settings.store_inventory,
+            mall_db_path=settings.store_mall,
+            orchestrator_db_path=settings.store_orchestrator,
+        )
+    else:
+        initialize_database(settings.db_path)
+
+
 class _LocalApprovalPlane:
     """The approval queue is a human admin plane, not an MCP tool set."""
 
     settings: Settings
 
     def get_approval(self, approval_id: str) -> ApprovalView | None:
-        return approval_queue.get_approval(self.settings.db_path, approval_id)
+        return approval_queue.get_approval(self.settings.approval_db, approval_id)
 
     def abandon_approval(
         self, approval_id: str, reason: str, abandoned_by: str | None = None
     ) -> ApprovalView:
         return approval_queue.abandon_approval(
-            self.settings.db_path, approval_id, reason, abandoned_by
+            self.settings.approval_db, approval_id, reason, abandoned_by
         )
 
     def decide_approval(
@@ -136,7 +160,7 @@ class _LocalApprovalPlane:
         decided_by: str | None = None,
     ) -> ApprovalView:
         return approval_queue.decide_approval(
-            self.settings.db_path, approval_id, decision, note, decided_by
+            self.settings.approval_db, approval_id, decision, note, decided_by
         )
 
 
@@ -155,11 +179,11 @@ class MCPToolClient(_LocalApprovalPlane):
         headers: dict[str, str] | None = None,
     ) -> None:
         self.settings = settings
-        # The orchestrator owns the task/approval DB even when tool calls go
-        # over MCP. Make sure the schema exists before the server starts.
-        initialize_database(settings.db_path)
+        # The orchestrator owns the task DB even when tool calls go over MCP.
+        # Make sure every configured store exists before the server starts.
+        initialize_stores(settings)
         self._executor = ToolExecutor(
-            settings, event_sink=make_event_sink(settings.db_path)
+            settings, event_sink=make_event_sink(settings.store_orchestrator)
         )
         self._call_lock = threading.Lock()
         self._loop = asyncio.new_event_loop()
@@ -196,7 +220,11 @@ class MCPToolClient(_LocalApprovalPlane):
 
     def _server_env(self, env: dict[str, str] | None) -> dict[str, str]:
         merged = dict(os.environ if env is None else env)
-        merged["STOCK_PILOT_DB"] = self.settings.db_path
+        merged["STOCK_PILOT_DB"] = self.settings.store_orchestrator
+        merged["STOCK_PILOT_DB_LAYOUT"] = self.settings.db_layout
+        if self.settings.split_stores:
+            merged["STOCK_PILOT_INVENTORY_DB"] = self.settings.store_inventory
+            merged["STOCK_PILOT_MALL_DB"] = self.settings.store_mall
         merged.setdefault("PYTHONUTF8", "1")
         src = str(PROJECT_ROOT / "src")
         existing = merged.get("PYTHONPATH")
@@ -464,6 +492,20 @@ class MCPToolClient(_LocalApprovalPlane):
             "publish_listing", request, PublishListingOutput, is_write=True
         )
 
+    def reserve_inventory(
+        self, request: ReserveInventoryInput
+    ) -> ReserveInventoryOutput:
+        return self._run(
+            "reserve_inventory", request, ReserveInventoryOutput, is_write=True
+        )
+
+    def release_inventory(
+        self, request: ReleaseInventoryInput
+    ) -> ReleaseInventoryOutput:
+        return self._run(
+            "release_inventory", request, ReleaseInventoryOutput, is_write=True
+        )
+
     def is_available(self) -> bool:
         return not self._closed and self._session is not None
 
@@ -498,7 +540,7 @@ class SplitMCPToolClient(_LocalApprovalPlane):
         headers: dict[str, str] | None = None,
         connect_timeout: float = 15.0,
     ) -> None:
-        initialize_database(settings.db_path)
+        initialize_stores(settings)
         self.settings = settings
         self._inventory = MCPToolClient(
             settings,
@@ -524,6 +566,16 @@ class SplitMCPToolClient(_LocalApprovalPlane):
 
     def publish_listing(self, request: PublishListingInput) -> PublishListingOutput:
         return self._mall.publish_listing(request)
+
+    def reserve_inventory(
+        self, request: ReserveInventoryInput
+    ) -> ReserveInventoryOutput:
+        return self._inventory.reserve_inventory(request)
+
+    def release_inventory(
+        self, request: ReleaseInventoryInput
+    ) -> ReleaseInventoryOutput:
+        return self._inventory.release_inventory(request)
 
     def is_available(self) -> bool:
         return self._inventory.is_available() and self._mall.is_available()

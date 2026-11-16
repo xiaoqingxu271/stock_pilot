@@ -17,6 +17,11 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "stock_pilot.db"
 @dataclass(frozen=True)
 class Settings:
     db_path: str = str(DEFAULT_DB_PATH)
+    # shared = one SQLite file for all modules (demo default);
+    # split = inventory / mall(+approvals) / orchestrator each own a file.
+    db_layout: str = "shared"
+    inventory_db_path: str | None = None
+    mall_db_path: str | None = None
     tool_timeout_seconds: float = 5.0
     read_max_retries: int = 2
     circuit_failure_threshold: int = 3
@@ -33,10 +38,48 @@ class Settings:
     # for production-like deployments that require a token even to read.
     require_read_auth: bool = False
 
+    def __post_init__(self) -> None:
+        if self.db_layout not in {"shared", "split"}:
+            raise ValueError(
+                f"db_layout must be 'shared' or 'split', got {self.db_layout!r}"
+            )
+
+    @property
+    def split_stores(self) -> bool:
+        return self.db_layout == "split"
+
+    def _sibling(self, name: str) -> str:
+        return str(Path(self.db_path).with_name(f"{name}.db"))
+
+    @property
+    def store_orchestrator(self) -> str:
+        return self.db_path
+
+    @property
+    def store_inventory(self) -> str:
+        if not self.split_stores:
+            return self.db_path
+        return self.inventory_db_path or self._sibling("inventory")
+
+    @property
+    def store_mall(self) -> str:
+        if not self.split_stores:
+            return self.db_path
+        return self.mall_db_path or self._sibling("mall")
+
+    @property
+    def approval_db(self) -> str:
+        """The approval queue gates mall writes, so it lives with the mall."""
+        return self.store_mall
+
     @classmethod
     def from_env(cls) -> Settings:
+        layout = os.environ.get("STOCK_PILOT_DB_LAYOUT", "shared").strip().lower()
         return cls(
             db_path=os.environ.get("STOCK_PILOT_DB", str(DEFAULT_DB_PATH)),
+            db_layout=layout,
+            inventory_db_path=os.environ.get("STOCK_PILOT_INVENTORY_DB") or None,
+            mall_db_path=os.environ.get("STOCK_PILOT_MALL_DB") or None,
             tool_timeout_seconds=float(os.environ.get("STOCK_PILOT_TOOL_TIMEOUT", "5")),
             read_max_retries=int(os.environ.get("STOCK_PILOT_READ_RETRIES", "2")),
             circuit_failure_threshold=int(

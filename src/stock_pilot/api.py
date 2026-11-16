@@ -96,10 +96,12 @@ def create_app(
 
     graph = build_graph(client, checkpointer)
     db_path = settings.db_path
+    approval_db = settings.approval_db
+    mall_db = settings.store_mall
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        issues = recovery.scan(db_path)
+        issues = recovery.scan(db_path, mall_db_path=mall_db)
         if issues:
             logger.warning(
                 "recovery scan found %d task(s) needing attention: %s",
@@ -248,17 +250,21 @@ def create_app(
     def list_recovery_issues(
         _principal: Principal | None = Depends(_require(None)),
     ) -> list[RecoveryIssue]:
-        return recovery.scan(db_path)
+        return recovery.scan(db_path, mall_db_path=mall_db)
 
     @app.get("/healthz", response_model=HealthStatus)
     def health(response: Response) -> HealthStatus:
         db_ok = True
+        stores = dict.fromkeys(
+            (db_path, mall_db, settings.store_inventory)
+        )
         try:
-            conn = sqlite3.connect(db_path, timeout=1.0)
-            try:
-                conn.execute("SELECT 1 FROM tasks LIMIT 1").fetchall()
-            finally:
-                conn.close()
+            for path in stores:
+                conn = sqlite3.connect(path, timeout=1.0)
+                try:
+                    conn.execute("SELECT 1").fetchall()
+                finally:
+                    conn.close()
         except sqlite3.Error:
             db_ok = False
 
@@ -272,8 +278,10 @@ def create_app(
         issues = 0
         if db_ok:
             try:
-                pending = len(approval.list_approvals(db_path, ApprovalStatus.PENDING))
-                issues = len(recovery.scan(db_path))
+                pending = len(
+                    approval.list_approvals(approval_db, ApprovalStatus.PENDING)
+                )
+                issues = len(recovery.scan(db_path, mall_db_path=mall_db))
             except sqlite3.Error:
                 db_ok = False
 
@@ -301,6 +309,7 @@ def create_app(
         return Response(
             content=render_metrics(
                 db_path,
+                mall_db_path=mall_db,
                 circuit_states=circuit_states,
                 tool_client_available=available,
             ),
@@ -324,7 +333,7 @@ def create_app(
                     f"task is {task.status.value}, nothing to recover",
                 )
             )
-        current = approval.get_approval(db_path, task.approval_id or "")
+        current = approval.get_approval(approval_db, task.approval_id or "")
         if current is None:
             raise _http_error(
                 ToolFailure(
@@ -340,7 +349,9 @@ def create_app(
                 )
             )
         if current.status is ApprovalStatus.APPROVED:
-            staged = approval.get_staging_for_approval(db_path, current.approval_id)
+            staged = approval.get_staging_for_approval(
+                approval_db, current.approval_id
+            )
             if staged is None or staged.status is not StagingStatus.PRICE_STAGED:
                 raise _http_error(
                     ToolFailure(
@@ -390,7 +401,7 @@ def create_app(
         principal: Principal | None = Depends(_require(Role.OPERATOR)),
     ) -> ApprovalView:
         abandoned_by = principal.name if principal is not None else None
-        current = approval.get_approval(db_path, approval_id)
+        current = approval.get_approval(approval_db, approval_id)
         if current is None:
             raise HTTPException(status_code=404, detail="approval not found")
         if current.status is ApprovalStatus.ABANDONED:
@@ -409,7 +420,7 @@ def create_app(
                 )
             )
 
-        listing = mall.get_listing_by_id(db_path, current.listing_id)
+        listing = mall.get_listing_by_id(mall_db, current.listing_id)
         if listing is None:
             raise _http_error(
                 ToolFailure(
@@ -469,7 +480,7 @@ def create_app(
         status: ApprovalStatus | None = Query(default=None),
         _principal: Principal | None = Depends(_require(None)),
     ) -> list[ApprovalView]:
-        return approval.list_approvals(db_path, status)
+        return approval.list_approvals(approval_db, status)
 
     @app.get("/approvals/queue", response_model=list[ApprovalQueueItem])
     def approval_queue(
@@ -477,14 +488,14 @@ def create_app(
         limit: int = Query(default=100, ge=1, le=500),
         _principal: Principal | None = Depends(_require(None)),
     ) -> list[ApprovalQueueItem]:
-        return approval.list_queue(db_path, status=status, limit=limit)
+        return approval.list_queue(approval_db, status=status, limit=limit)
 
     @app.get("/approvals/{approval_id}", response_model=ApprovalView)
     def get_approval_record(
         approval_id: str,
         _principal: Principal | None = Depends(_require(None)),
     ) -> ApprovalView:
-        record = approval.get_approval(db_path, approval_id)
+        record = approval.get_approval(approval_db, approval_id)
         if record is None:
             raise HTTPException(status_code=404, detail="approval not found")
         return record

@@ -18,6 +18,7 @@ import os
 
 from mcp.server.mcpserver import MCPServer
 
+from stock_pilot.config import Settings
 from stock_pilot.models import (
     CheckInventoryInput,
     CheckInventoryOutput,
@@ -25,6 +26,10 @@ from stock_pilot.models import (
     GetListingOutput,
     PublishListingInput,
     PublishListingOutput,
+    ReleaseInventoryInput,
+    ReleaseInventoryOutput,
+    ReserveInventoryInput,
+    ReserveInventoryOutput,
     UpdatePriceInput,
     UpdatePriceOutput,
 )
@@ -51,6 +56,43 @@ def register_inventory_tools(server: MCPServer, tools: StockPilotTools) -> None:
     async def check_inventory(sku_id: str, spec: str) -> CheckInventoryOutput:
         request = CheckInventoryInput(sku_id=sku_id, spec=spec)
         return await asyncio.to_thread(tools.check_inventory, request)
+
+
+def register_inventory_saga_tools(
+    server: MCPServer, tools: StockPilotTools
+) -> None:
+    """Internal reserve/release steps used only by the split deployment.
+
+    These are not part of the four model-facing tools; they close the
+    recheck-to-commit race without giving the model a write primitive.
+    """
+
+    @server.tool(
+        name="reserve_inventory",
+        description=(
+            "Internal saga step. Hold stock for an approved proposal until "
+            "the mall commit completes or is abandoned."
+        ),
+        structured_output=True,
+    )
+    async def reserve_inventory(
+        inventory_record_id: str, approval_id: str
+    ) -> ReserveInventoryOutput:
+        request = ReserveInventoryInput(
+            inventory_record_id=inventory_record_id, approval_id=approval_id
+        )
+        return await asyncio.to_thread(tools.reserve_inventory, request)
+
+    @server.tool(
+        name="release_inventory",
+        description=(
+            "Internal saga step. Release a stock reservation; idempotent."
+        ),
+        structured_output=True,
+    )
+    async def release_inventory(approval_id: str) -> ReleaseInventoryOutput:
+        request = ReleaseInventoryInput(approval_id=approval_id)
+        return await asyncio.to_thread(tools.release_inventory, request)
 
 
 def register_mall_tools(server: MCPServer, tools: StockPilotTools) -> None:
@@ -103,15 +145,21 @@ def register_mall_tools(server: MCPServer, tools: StockPilotTools) -> None:
         return await asyncio.to_thread(tools.publish_listing, request)
 
 
+def _server_tools() -> StockPilotTools:
+    return StockPilotTools(Settings.from_env(), record_events=False)
+
+
 def build_inventory_server(tools: StockPilotTools | None = None) -> MCPServer:
-    tools = tools or StockPilotTools()
+    tools = tools or _server_tools()
     server = _new_server("stock-pilot-inventory", READ_ONLY_INSTRUCTIONS)
     register_inventory_tools(server, tools)
+    if tools.settings.split_stores:
+        register_inventory_saga_tools(server, tools)
     return server
 
 
 def build_mall_server(tools: StockPilotTools | None = None) -> MCPServer:
-    tools = tools or StockPilotTools()
+    tools = tools or _server_tools()
     server = _new_server(
         "stock-pilot-mall",
         (
@@ -124,7 +172,7 @@ def build_mall_server(tools: StockPilotTools | None = None) -> MCPServer:
 
 
 def build_mcp_server(tools: StockPilotTools | None = None) -> MCPServer:
-    tools = tools or StockPilotTools()
+    tools = tools or _server_tools()
     server = _new_server(
         "stock-pilot",
         (
@@ -134,6 +182,8 @@ def build_mcp_server(tools: StockPilotTools | None = None) -> MCPServer:
         ),
     )
     register_inventory_tools(server, tools)
+    if tools.settings.split_stores:
+        register_inventory_saga_tools(server, tools)
     register_mall_tools(server, tools)
     return server
 
