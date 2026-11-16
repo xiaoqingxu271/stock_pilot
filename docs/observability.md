@@ -37,7 +37,10 @@ MCP 模式下，工具服务端也会把尝试写入共享演示库；服务端�
 `stock_pilot_outbox_dead` 增加，不再无限重试；已投递与死信行超过
 `STOCK_PILOT_OUTBOX_RETENTION`（默认 7 天）后被清理。投递是至少一次语义，
 崩溃可能在发送后、标记前重放一条通知；消费方按 `dedupe_key` 去重。worker 不
-持有工具客户端，**不会重投任何写操作**，详见 `docs/adr/0007`。
+持有工具客户端，**不会重投任何写操作**，详见 `docs/adr/0007`。配置
+`STOCK_PILOT_WEBHOOK_URL` 后发送器改为 HTTP POST（带超时和可选 HMAC
+签名）；失败信息不包含 URL。`GET /outbox` 可查看 pending / delivered / dead
+事件，`POST /outbox/{id}/retry`（operator）只重投死信，仍然与工具客户端无关。
 
 `GET /healthz` 与指标同源：数据库不可读或工具客户端不可用时返回 `503` 与
 `status=degraded`，同时暴露 `pending_approvals`、`recovery_issues`。

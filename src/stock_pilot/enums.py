@@ -28,6 +28,12 @@ class ErrorCode(str, Enum):
     LISTING_PRICE_CHANGED = "LISTING_PRICE_CHANGED"
     INVALID_STATE = "INVALID_STATE"
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
+    OUTBOX_EVENT_NOT_FOUND = "OUTBOX_EVENT_NOT_FOUND"
+
+    # LLM intake (parameter extraction only; never executes a tool)
+    LLM_UNAVAILABLE = "LLM_UNAVAILABLE"
+    LLM_TIMEOUT = "LLM_TIMEOUT"
+    LLM_INVALID_OUTPUT = "LLM_INVALID_OUTPUT"
 
     # Execution failures
     TOOL_TIMEOUT = "TOOL_TIMEOUT"
@@ -79,6 +85,14 @@ class PendingStage(str, Enum):
 
     PRICE_STAGED = "price_staged"
     PUBLISH_PENDING = "publish_pending"
+
+
+class OutboxState(str, Enum):
+    """Operator-facing view of one notification event."""
+
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    DEAD = "dead"
 
 
 class RecoveryKind(str, Enum):

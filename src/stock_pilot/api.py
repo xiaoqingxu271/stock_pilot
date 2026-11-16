@@ -25,6 +25,7 @@ from stock_pilot import (
     approval,
     audit,
     auth,
+    intake,
     mall,
     notifications,
     recovery,
@@ -48,6 +49,7 @@ from stock_pilot.enums import (
     ErrorCode,
     ListingResult,
     ListingStatus,
+    OutboxState,
     StagingStatus,
     TaskStatus,
 )
@@ -63,8 +65,11 @@ from stock_pilot.models import (
     HealthStatus,
     ListReservationsOutput,
     MappingConfirmRequest,
+    OutboxEventView,
     RecoveryIssue,
     ReservationGcResponse,
+    TaskDraft,
+    TaskIntakeRequest,
     TaskView,
     ToolEvent,
 )
@@ -74,7 +79,11 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-_NOT_FOUND = {ErrorCode.APPROVAL_NOT_FOUND, ErrorCode.MAPPING_NOT_FOUND}
+_NOT_FOUND = {
+    ErrorCode.APPROVAL_NOT_FOUND,
+    ErrorCode.MAPPING_NOT_FOUND,
+    ErrorCode.OUTBOX_EVENT_NOT_FOUND,
+}
 _CONFLICT = {
     ErrorCode.APPROVAL_ALREADY_DECIDED,
     ErrorCode.INVALID_STATE,
@@ -103,9 +112,11 @@ def create_app(
     tools: StockPilotTools | None = None,
     checkpointer=None,
     tool_client: ToolClient | None = None,
+    llm_client: intake.LLMClient | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     client: ToolClient = tool_client or tools or create_tool_client(settings)
+    llm = llm_client or intake.create_llm_client(settings)
     if checkpointer is None:
         conn = sqlite3.connect(settings.db_path, check_same_thread=False)
         checkpointer = SqliteSaver(conn)
@@ -117,6 +128,7 @@ def create_app(
     # Notification-only worker: it is constructed without any tool client.
     outbox_worker = notifications.OutboxWorker(
         db_path,
+        sender=notifications.create_sender(settings),
         interval_seconds=settings.outbox_interval_seconds,
         max_attempts=settings.outbox_max_attempts,
         retention_seconds=settings.outbox_retention_seconds,
@@ -174,6 +186,7 @@ def create_app(
     app.state.checkpointer = checkpointer
     app.state.outbox_worker = outbox_worker
     app.state.reservation_sweeper = reservation_sweeper
+    app.state.llm_client = llm
 
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -269,6 +282,28 @@ def create_app(
             response.status_code = 200
             return _replay_existing(existing, request)
 
+    @app.post("/tasks/intake", response_model=TaskDraft)
+    def intake_task(
+        request: TaskIntakeRequest,
+        _principal: Principal | None = Depends(_require(Role.AGENT)),
+    ) -> TaskDraft:
+        """Extract task parameters from free text. Draft only; never executes."""
+        if llm is None:
+            raise HTTPException(
+                status_code=503,
+                detail="natural-language intake is disabled"
+                " (set STOCK_PILOT_LLM=anthropic and STOCK_PILOT_LLM_API_KEY)",
+            )
+        try:
+            return intake.extract_task(llm, request.text)
+        except ToolFailure as exc:
+            status = (
+                503
+                if exc.code in {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_TIMEOUT}
+                else 502
+            )
+            raise HTTPException(status_code=status, detail=exc.message) from exc
+
     @app.get("/tasks", response_model=list[TaskView])
     def list_task_records(
         _principal: Principal | None = Depends(_require(None)),
@@ -336,6 +371,26 @@ def create_app(
                     status_code=503,
                     detail=f"reservation sweep unavailable: {exc.message}",
                 ) from exc
+            raise _http_error(exc) from exc
+
+    @app.get("/outbox", response_model=list[OutboxEventView])
+    def list_outbox_events(
+        status: OutboxState | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+        _principal: Principal | None = Depends(_require(None)),
+    ) -> list[OutboxEventView]:
+        """Read-only notification queue; delivery state only, no task writes."""
+        return notifications.list_events(db_path, status=status, limit=limit)
+
+    @app.post("/outbox/{event_id}/retry", response_model=OutboxEventView)
+    def retry_outbox_event(
+        event_id: int,
+        _principal: Principal | None = Depends(_require(Role.OPERATOR)),
+    ) -> OutboxEventView:
+        """Re-arm a dead-lettered notification. Never re-drives a tool write."""
+        try:
+            return notifications.retry_dead(db_path, event_id)
+        except ToolFailure as exc:
             raise _http_error(exc) from exc
 
     @app.get("/healthz", response_model=HealthStatus)

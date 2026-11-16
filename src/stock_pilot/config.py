@@ -7,8 +7,9 @@ guarded by a per-tool circuit breaker. Writes never retry blindly.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "stock_pilot.db"
@@ -42,6 +43,18 @@ class Settings:
     # (the default for demos); the sweep rule stays as conservative as the
     # operator-triggered endpoint.
     reservation_gc_interval_seconds: float = 0.0
+    # Optional natural-language intake. The provider only extracts task
+    # parameters; its output is validated and returned as a draft, never
+    # executed. "off" keeps the API deterministic and needs no credentials.
+    llm_provider: str = "off"
+    llm_model: str = "claude-opus-5-5"
+    llm_api_key: str | None = field(default=None, repr=False)
+    llm_timeout_seconds: float = 10.0
+    # Optional webhook delivery for the notification-only outbox. The sender
+    # has no tool client and cannot re-drive a write.
+    webhook_url: str | None = None
+    webhook_secret: str | None = field(default=None, repr=False)
+    webhook_timeout_seconds: float = 5.0
     # Production split: two HTTP MCP servers over a shared demo database.
     inventory_mcp_url: str = "http://127.0.0.1:8101/mcp"
     mall_mcp_url: str = "http://127.0.0.1:8102/mcp"
@@ -69,6 +82,20 @@ class Settings:
             raise ValueError("outbox_retention_seconds must be positive")
         if self.reservation_gc_interval_seconds < 0:
             raise ValueError("reservation_gc_interval_seconds must not be negative")
+        if self.llm_provider not in {"off", "anthropic"}:
+            raise ValueError(
+                f"llm_provider must be 'off' or 'anthropic', got {self.llm_provider!r}"
+            )
+        if self.llm_provider == "anthropic" and not self.llm_api_key:
+            raise ValueError("llm_api_key is required when llm_provider='anthropic'")
+        if self.llm_timeout_seconds <= 0:
+            raise ValueError("llm_timeout_seconds must be positive")
+        if self.webhook_timeout_seconds <= 0:
+            raise ValueError("webhook_timeout_seconds must be positive")
+        if self.webhook_url is not None:
+            parsed = urlparse(self.webhook_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("webhook_url must be an http(s) URL")
 
     @property
     def split_stores(self) -> bool:
@@ -128,6 +155,17 @@ class Settings:
             ),
             reservation_gc_interval_seconds=float(
                 os.environ.get("STOCK_PILOT_RESERVATION_GC_INTERVAL", "0")
+            ),
+            llm_provider=os.environ.get("STOCK_PILOT_LLM", "off").strip().lower(),
+            llm_model=os.environ.get("STOCK_PILOT_LLM_MODEL", "claude-opus-5-5"),
+            llm_api_key=os.environ.get("STOCK_PILOT_LLM_API_KEY") or None,
+            llm_timeout_seconds=float(
+                os.environ.get("STOCK_PILOT_LLM_TIMEOUT", "10")
+            ),
+            webhook_url=os.environ.get("STOCK_PILOT_WEBHOOK_URL") or None,
+            webhook_secret=os.environ.get("STOCK_PILOT_WEBHOOK_SECRET") or None,
+            webhook_timeout_seconds=float(
+                os.environ.get("STOCK_PILOT_WEBHOOK_TIMEOUT", "5")
             ),
             inventory_mcp_url=os.environ.get(
                 "STOCK_PILOT_INVENTORY_URL", "http://127.0.0.1:8101/mcp"

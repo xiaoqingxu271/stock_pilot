@@ -5,7 +5,7 @@
 ## 0. 启动（30 秒）
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q               # 129 passed
+./.venv/Scripts/python.exe -m pytest -q               # 153 passed
 ./.venv/Scripts/python.exe -m ruff check src tests
 ./.venv/Scripts/python.exe -m stock_pilot.demo        # http://127.0.0.1:8000/
 # --split 同时拉起两个 HTTP MCP Server 并拆成三个库；--fresh 只重建配置的演示库
@@ -118,7 +118,23 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http STOCK_PILOT_ADMIN_TOKEN=demo-admin-token \
 `POST /reservations/gc`）。说明清理只按审批/任务状态判断，不看 TTL；如果审批仍可
 发布，即使预留超龄也只标记 `reservation_stale`。
 
-## 5. 收尾（30 秒）
+## 5. 自然语言入口（可选，30 秒）
+
+主演示不需要任何模型 Key：入口默认关闭，`POST /tasks/intake` 返回 `503`，
+先说明「模型不在这条执行链上」。
+
+若本地配置了 `STOCK_PILOT_LLM=anthropic` 与 `STOCK_PILOT_LLM_API_KEY`：
+
+```bash
+curl -s -X POST localhost:8000/tasks/intake \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"把 SKU-TSHIRT-001 白色-M 调到 59 元，清库存"}'
+```
+
+返回的是 `TaskDraft`（不落库、未执行）。强调三点：模型没有工具；多余字段、
+越界价格、缺失字段会被拒绝；确认后仍要 `POST /tasks` 走完整审批与写保护。
+
+## 6. 收尾（30 秒）
 
 `GET /healthz` 返回数据库与工具客户端就绪状态（不可用时 503），部署层据此
 摘流量。整个设计文档见 `README.md`，关键取舍见 `docs/adr/`。

@@ -48,6 +48,19 @@ tests inject a recording or failing sender. The worker calls
 - the worker never imports or receives `ToolClient`, so it cannot call
   `publish_listing`, `update_price`, or any other MCP tool.
 
+### Senders and dead-letter operations
+
+`LogSender` is the default. Setting `STOCK_PILOT_WEBHOOK_URL` switches to
+`WebhookSender`, which POSTs the event with a bounded timeout and an optional
+HMAC-SHA256 signature (`X-StockPilot-Signature: sha256=...`). Delivery errors
+never include the URL, so a token embedded in it cannot reach a log.
+
+`GET /outbox` lists pending, delivered, or dead events (read-only).
+`POST /outbox/{id}/retry` (operator) clears `dead_lettered_at`, resets
+`attempts`, and lets the worker try again. It is idempotent for pending rows
+and refuses delivered rows. Neither endpoint imports or receives a tool
+client; a retry can only re-send a notification.
+
 ### Retention
 
 Delivered and dead-lettered rows are pruned after
@@ -68,9 +81,10 @@ separate process.
   at-least-once delivery with an explicit dedupe key.
 - No new write can originate from the outbox. This is enforced structurally
   (no client dependency), not just by convention.
-- Remaining limit: only a log sender ships today; an external webhook/SNS
-  sender can be added behind the same interface without changing the
-  write-side rules.
+- Remaining limit: the webhook sender is generic HTTP; provider-specific
+  adapters (SNS, event bus) can be added behind the same interface without
+  changing the write-side rules.
 - Tests cover atomic enqueue and rollback, non-terminal no-op, dedupe,
   delivery once, sender failure and retry, dead-lettering after the attempt
-  budget, retention pruning, both metrics, and lifespan wiring end to end.
+  budget, retention pruning, webhook signing, dead-letter retry auth and
+  idempotency, both metrics, and lifespan wiring end to end.

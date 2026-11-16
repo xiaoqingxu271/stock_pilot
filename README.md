@@ -28,6 +28,8 @@ curl -s localhost:8000/healthz
 curl -s localhost:8000/metrics | grep reservations
 curl -s localhost:8000/reservations          # 只读列出存活预留
 curl -s -X POST localhost:8000/reservations/gc   # operator 清理（无 Token 时本地开放）
+curl -s 'localhost:8000/outbox?status=dead'  # 只读查看死信通知
+curl -s -X POST localhost:8000/outbox/1/retry    # operator 重投死信（不重放写操作）
 ```
 
 ![StockPilot 审批台](docs/screenshots/console.png)
@@ -51,6 +53,7 @@ curl -s -X POST localhost:8000/reservations/gc   # operator 清理（无 Token �
 | 拆分存储下的提交期库存 | 复核后先预留库存，失败则撤回提案、商城零写入；提交后尽力释放预留 |
 | 预留后进程崩溃 | 恢复扫描报 `reservation_orphaned`；`POST /reservations/gc` 只释放审批已终止/缺失或任务终态的预留，活跃审批的预留不自动释放 |
 | 终态通知 | 任务终态与 `outbox_events` 同一事务写入；worker 至少一次投递，但结构上不持有工具客户端，**不重投任何写操作** |
+| 自然语言输入 | 模型只抽取参数并严格校验，返回**不落库的草稿**；不持有工具，确认后仍走完整库存 / 映射 / 审批链 |
 | 进程中断 | 重启后 `GET /recovery` 显式列出异常态；已审批提案可安全恢复，未审批任务沿用原流程 |
 | 重复请求 | `Idempotency-Key` 保证 `POST /tasks` 不重复建任务；重复审批返回当前结果 |
 | 操作人身份 | 配置 Token 后写接口按角色校验；`decided_by` / `abandoned_by` 取自身份，不信任请求体 |
@@ -107,7 +110,9 @@ curl -s -X POST localhost:8000/reservations/gc   # operator 清理（无 Token �
 
 **预留 TTL 与清理（E5）**：`release_inventory` 是尽力补偿，进程若在预留后崩溃，库存会被长期占用。系统提供只读 `GET /reservations` 与 operator 触发的 `POST /reservations/gc`：清理只释放审批已 `consumed` / `rejected` / `abandoned`、审批缺失或任务已终态的预留；审批仍可发布且任务活跃的预留**绝不自动释放**。`STOCK_PILOT_RESERVATION_TTL`（默认 900 秒）只用于把超龄预留标记为 `reservation_stale` 并报警，不构成释放许可。`GET /recovery` 与审批台会显示 `reservation_orphaned` / `reservation_stale`，面板提供「释放遗留预留」按钮。长驻部署可设置 `STOCK_PILOT_RESERVATION_GC_INTERVAL`（秒，默认 0 关闭）让进程内定时器周期执行**同一个**保守清理；它不会因为超龄而释放审批仍可发布的预留。设计见 `docs/adr/0006-reservation-ttl-and-gc.md`。
 
-**仅通知 outbox（P2）**：任务进入终态时，`tasks` 更新与 `outbox_events` 在**同一事务**落库，`dedupe_key` 防止重复。API lifespan 启动的后台 worker 只持有数据库路径与 `NotificationSender`（默认写结构化日志），按至少一次投递；发送失败保留 pending 并累计 `attempts` / `last_error`；达到 `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS`（默认 60，默认轮询下约 2 分钟）后转入死信，不再无限重试，已投递/死信行超过 `STOCK_PILOT_OUTBOX_RETENTION`（默认 7 天）后由 worker 清理。它**不持有任何工具客户端**，所以结构上不可能重放 `publish_listing` 或 `update_price`——与 ADR 0005 的「不确定即停写」一致。指标 `stock_pilot_outbox_pending` / `stock_pilot_outbox_dead` 暴露积压与死信。设计见 `docs/adr/0007-notification-outbox.md`。
+**仅通知 outbox（P2）**：任务进入终态时，`tasks` 更新与 `outbox_events` 在**同一事务**落库，`dedupe_key` 防止重复。API lifespan 启动的后台 worker 只持有数据库路径与 `NotificationSender`（默认写结构化日志），按至少一次投递；发送失败保留 pending 并累计 `attempts` / `last_error`；达到 `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS`（默认 60，默认轮询下约 2 分钟）后转入死信，不再无限重试，已投递/死信行超过 `STOCK_PILOT_OUTBOX_RETENTION`（默认 7 天）后由 worker 清理。它**不持有任何工具客户端**，所以结构上不可能重放 `publish_listing` 或 `update_price`——与 ADR 0005 的「不确定即停写」一致。指标 `stock_pilot_outbox_pending` / `stock_pilot_outbox_dead` 暴露积压与死信。配置 `STOCK_PILOT_WEBHOOK_URL` 后发送器改为带超时与可选 HMAC 签名的 webhook；`GET /outbox` 只读查看队列，`POST /outbox/{id}/retry`（operator）可重投死信，仍然不接触任何工具。设计见 `docs/adr/0007-notification-outbox.md`。
+
+**自然语言入口（P5）**：`POST /tasks/intake` 接受自由文本，模型只负责抽取 `sku_id` / `spec` / `target_price` / `reason`，经严格 Pydantic 校验后返回 `TaskDraft` 和 `warnings`。草稿**不落库、不调工具、不具备任何权限**；调用方确认后仍提交到 `POST /tasks`，所有库存、映射、审批与超时规则重新执行。入口默认关闭（`STOCK_PILOT_LLM=off`，返回 503）；开启 `anthropic` 需要可选的 `[llm]` extra 与本地环境变量中的 API Key。未知 SKU 不在入口处猜测，而是在 `check_inventory` 安全失败。设计见 `docs/adr/0008-llm-intake-extracts-parameters-only.md`。
 
 **发布前复核**：审批可能持续数小时，库存不是审批时的快照。图在 `await_approval` 与 `publish` 之间增加 `recheck_stock`：库存不足、记录消失或复核工具失败时，系统不提交，而是把审批标记为 `abandoned` 并在同一事务里丢弃 staging；任务进入 `ROLLED_BACK`（库存不足）或 `ABORTED_UNKNOWN_STATE`（无法确认）。`abandoned` 不是人工拒绝，审计上区分开。
 
@@ -124,6 +129,7 @@ Windows Git Bash：
 ```bash
 python -m venv .venv
 ./.venv/Scripts/python.exe -m pip install -e ".[dev]"
+# 生产环境只需可选的自然语言入口依赖时：pip install -e ".[llm]"
 
 # 一条命令：建库 + 启动审批台（默认进程内模式）
 ./.venv/Scripts/python.exe -m stock_pilot.demo
@@ -201,7 +207,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 129 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 153 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -221,6 +227,8 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_split_stores.py`：三库隔离、预留互斥/幂等/释放、拆分 API 与指标跨库读取、MCP 预留工具路由，以及「商城已提交但响应丢失」时只读采纳且不重发写。
 - `tests/test_reservations.py`：清理只释放审批终止/缺失/任务终态的预留；活跃审批的预留即使超过 TTL 也只标记 stale 且仍能完成发布；清理幂等、operator 鉴权、恢复扫描与指标；进程内定时器只在显式配置时启动且不抢活跃预留。
 - `tests/test_outbox.py`：终态与通知同事务、入队失败回滚任务、重复终态去重、至少一次投递与失败重试、重试上限后转死信、保留期只清理已投递/死信行、pending/dead 指标、lifespan worker，以及零工具写入。
+- `tests/test_webhook.py`：webhook 请求体与 HMAC 签名、非 2xx 时错误不含 URL；`GET /outbox` 状态过滤、死信重投的 operator 鉴权与幂等、已投递/不存在事件拒绝，以及重投不触碰商城或工具审计。
+- `tests/test_intake.py`：草稿零写入、缺少理由的警告、缺字段/越界/多余字段拒绝、上游失败映射、默认关闭与 agent 鉴权、未知 SKU 安全失败、价格归一化、Anthropic 适配器与密钥不出现在 `repr(Settings)`。
 
 ## 目录
 
@@ -240,7 +248,8 @@ src/stock_pilot/
   auth.py         静态 Bearer Token 与角色
   recovery.py     只读重启对账
   reservations.py 预留清理规则与可选定时器
-  notifications.py 仅通知 outbox（死信 / 保留清理）
+  notifications.py 仅通知 outbox（webhook / 死信 / 保留清理）
+  intake.py       可选自然语言入口（只抽取参数，不持有工具）
   demo.py         一条命令启动演示（可选拆分拓扑）
   agent.py        LangGraph 状态机
   api.py          FastAPI + 静态审批台
@@ -254,11 +263,11 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 
 ## 文档
 
-- `docs/interview-notes.md`：3 分钟叙述、10 个高频追问、失败矩阵与已知边界。
+- `docs/interview-notes.md`：3 分钟叙述、11 个高频追问、失败矩阵与已知边界。
 - `docs/demo.md`：约 8 分钟的面试演示脚本，含失败路径与拆分/鉴权演示。
 - `docs/screenshots/console.png`：审批台截图（演示数据：待审批 / 映射歧义 / 已核对 / 库存终止）。
 - `docs/observability.md`：指标、告警规则、结构化日志与断线重连语义。
-- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理、三库与发布 saga、预留 TTL 与清理、通知 outbox 的决策记录。
+- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理、三库与发布 saga、预留 TTL 与清理、通知 outbox、自然语言入口只做参数抽取的决策记录。
 
 ## 设计取舍与生产化
 
@@ -267,11 +276,11 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 生产化继续方向：
 
 1. 预留清理支持 operator 手动触发与可选的进程内定时调度（`STOCK_PILOT_RESERVATION_GC_INTERVAL`，默认关闭）；生产可改用外部 cron 并接入告警。
-2. Postgres 替换 SQLite；通知 outbox 已落地死信与保留清理，生产再补外部 webhook 发送器。
+2. Postgres 替换 SQLite；通知 outbox 已落地 webhook、死信重投与保留清理，生产可再接 SNS / 事件总线适配器。
 3. 静态 Token 换成 OIDC / 真实登录；只读鉴权已可通过 `STOCK_PILOT_REQUIRE_READ_AUTH` 开启，生产再接入统一网关。
 4. 指标与结构化日志已落地（Prometheus `/metrics`、JSON 日志）；生产再接入告警平台、日志聚合与审批审计导出。
 
-已知限制：SQLite 适合单实例演示；预留 TTL 只是观测门槛，超龄预留仍需按审批/任务状态清理；静态 Token 没有轮换与细粒度权限；admin 自审只告警不阻断（正常流程由角色分离保证审批人 ≠ 提交人）。
+已知限制：SQLite 适合单实例演示；预留 TTL 只是观测门槛，超龄预留仍需按审批/任务状态清理；静态 Token 没有轮换与细粒度权限；admin 自审只告警不阻断（正常流程由角色分离保证审批人 ≠ 提交人）；自然语言入口默认关闭、目前只有 Anthropic 适配器，且尚未提供审批台输入框。
 
 ## License
 

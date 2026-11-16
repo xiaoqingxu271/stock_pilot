@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -269,6 +269,26 @@ class CreateTaskRequest(StrictModel):
     reason: Annotated[str, Field(min_length=1, max_length=500)]
 
 
+class TaskIntakeRequest(StrictModel):
+    """Free text handed to the optional extraction layer."""
+
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class TaskDraft(BaseModel):
+    """A proposal from intake. It is never persisted and grants no authority.
+
+    Callers must submit it through ``POST /tasks``, where every inventory,
+    mapping, and approval check runs again.
+    """
+
+    sku_id: ShortText
+    spec: SpecText
+    target_price: Money
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ApprovalDecisionRequest(StrictModel):
     decision: ApprovalDecision
     note: str | None = Field(default=None, max_length=500)
@@ -340,6 +360,21 @@ class ToolEvent(BaseModel):
     error_code: ErrorCode | None = None
     latency_ms: int
     created_at: datetime
+
+
+class OutboxEventView(BaseModel):
+    """Read-only operator view of a notification event."""
+
+    event_id: int
+    dedupe_key: str
+    topic: str
+    task_id: str | None
+    payload: dict[str, Any]
+    created_at: datetime
+    delivered_at: datetime | None
+    dead_lettered_at: datetime | None
+    attempts: int
+    last_error: str | None
 
 
 class HealthStatus(BaseModel):

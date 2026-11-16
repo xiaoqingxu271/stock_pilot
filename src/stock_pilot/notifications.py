@@ -13,21 +13,30 @@ state and its notification must share one transaction.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
+from stock_pilot.config import Settings
 from stock_pilot.db import connect, iso, parse_dt, transaction, utcnow
 from stock_pilot.enums import (
     TERMINAL_TASK_STATUSES,
+    ErrorCode,
     NotificationTopic,
+    OutboxState,
     TaskStatus,
 )
+from stock_pilot.errors import ToolFailure
+from stock_pilot.models import OutboxEventView
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +71,78 @@ class LogSender:
             event.dedupe_key,
             json.dumps(event.payload, ensure_ascii=False, sort_keys=True),
         )
+
+
+class WebhookSender:
+    """POST one notification event to an operator-configured endpoint.
+
+    Delivery errors stay inside the outbox retry/dead-letter path; the raised
+    messages omit the URL so a token embedded in it cannot reach a log. When a
+    secret is configured the raw body is signed with HMAC-SHA256 and the
+    signature is sent in ``X-StockPilot-Signature``.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        secret: str | None = None,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self.url = url
+        self.secret = secret
+        self.timeout_seconds = timeout_seconds
+
+    def send(self, event: NotificationEvent) -> None:
+        body = json.dumps(
+            {
+                "event_id": event.event_id,
+                "dedupe_key": event.dedupe_key,
+                "topic": event.topic.value,
+                "task_id": event.task_id,
+                "payload": event.payload,
+                "created_at": iso(event.created_at),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "StockPilot-Outbox/0.1",
+        }
+        if self.secret:
+            digest = hmac.new(
+                self.secret.encode("utf-8"), body, hashlib.sha256
+            ).hexdigest()
+            headers["X-StockPilot-Signature"] = f"sha256={digest}"
+        request = urllib.request.Request(
+            self.url, data=body, headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout_seconds
+            ) as response:
+                if response.status >= 300:
+                    raise RuntimeError(
+                        f"webhook returned HTTP {response.status}"
+                    )
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"webhook returned HTTP {exc.code}") from None
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise RuntimeError("webhook delivery failed") from exc
+
+
+def create_sender(settings: Settings) -> NotificationSender:
+    """Use the webhook when configured; otherwise keep the local log sender."""
+    if settings.webhook_url:
+        return WebhookSender(
+            settings.webhook_url,
+            secret=settings.webhook_secret,
+            timeout_seconds=settings.webhook_timeout_seconds,
+        )
+    return LogSender()
 
 
 def enqueue_terminal(tx: sqlite3.Connection, task_id: str) -> None:
@@ -126,6 +207,105 @@ def dead_count(db_path: str) -> int:
         ).fetchone()["n"]
     finally:
         conn.close()
+
+
+_VIEW_COLUMNS = (
+    "id, dedupe_key, topic, task_id, payload_json, created_at,"
+    " delivered_at, dead_lettered_at, attempts, last_error"
+)
+
+_STATE_FILTERS = {
+    OutboxState.PENDING: "delivered_at IS NULL AND dead_lettered_at IS NULL",
+    OutboxState.DELIVERED: "delivered_at IS NOT NULL",
+    OutboxState.DEAD: "dead_lettered_at IS NOT NULL",
+}
+
+
+def _view_from_row(row: sqlite3.Row) -> OutboxEventView:
+    return OutboxEventView(
+        event_id=row["id"],
+        dedupe_key=row["dedupe_key"],
+        topic=row["topic"],
+        task_id=row["task_id"],
+        payload=json.loads(row["payload_json"]),
+        created_at=parse_dt(row["created_at"]),
+        delivered_at=(
+            parse_dt(row["delivered_at"]) if row["delivered_at"] else None
+        ),
+        dead_lettered_at=(
+            parse_dt(row["dead_lettered_at"]) if row["dead_lettered_at"] else None
+        ),
+        attempts=row["attempts"],
+        last_error=row["last_error"],
+    )
+
+
+def list_events(
+    db_path: str,
+    *,
+    status: OutboxState | None = None,
+    limit: int = 100,
+) -> list[OutboxEventView]:
+    """Read the notification queue for operators; no delivery happens here."""
+    sql = f"SELECT {_VIEW_COLUMNS} FROM outbox_events"
+    params: list[Any] = []
+    if status is not None:
+        sql += f" WHERE {_STATE_FILTERS[status]}"
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [_view_from_row(row) for row in rows]
+
+
+def get_event(db_path: str, event_id: int) -> OutboxEventView | None:
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            f"SELECT {_VIEW_COLUMNS} FROM outbox_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return _view_from_row(row) if row is not None else None
+
+
+def retry_dead(db_path: str, event_id: int) -> OutboxEventView:
+    """Re-arm a dead-lettered event. Notification-only, never a write replay.
+
+    Delivered events are immutable (409 at the API). A still-pending event is
+    returned unchanged, so a repeated retry is idempotent.
+    """
+    with transaction(db_path) as tx:
+        row = tx.execute(
+            f"SELECT {_VIEW_COLUMNS} FROM outbox_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise ToolFailure(
+                ErrorCode.OUTBOX_EVENT_NOT_FOUND,
+                f"outbox event {event_id} does not exist",
+            )
+        if row["delivered_at"] is not None:
+            raise ToolFailure(
+                ErrorCode.INVALID_STATE,
+                "delivered notifications cannot be retried",
+            )
+        if row["dead_lettered_at"] is not None:
+            tx.execute(
+                "UPDATE outbox_events SET attempts = 0, last_error = NULL,"
+                " dead_lettered_at = NULL WHERE id = ?",
+                (event_id,),
+            )
+            row = tx.execute(
+                f"SELECT {_VIEW_COLUMNS} FROM outbox_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+    assert row is not None
+    return _view_from_row(row)
 
 
 def prune(
