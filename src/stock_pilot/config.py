@@ -23,7 +23,7 @@ class Settings:
     circuit_cooldown_seconds: float = 30.0
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         return cls(
             db_path=os.environ.get("STOCK_PILOT_DB", str(DEFAULT_DB_PATH)),
             tool_timeout_seconds=float(os.environ.get("STOCK_PILOT_TOOL_TIMEOUT", "5")),

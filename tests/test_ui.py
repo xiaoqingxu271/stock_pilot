@@ -38,6 +38,8 @@ def test_ui_index_is_served(client):
     assert "StockPilot" in response.text
     assert "/static/app.js" in response.text
     assert "/static/styles.css" in response.text
+    assert 'id="operator-name"' in response.text
+    assert 'id="recovery-panel"' in response.text
 
 
 def test_ui_static_assets_are_served(client):
@@ -49,6 +51,8 @@ def test_ui_static_assets_are_served(client):
     assert js.status_code == 200
     assert "javascript" in js.headers["content-type"]
     assert "refresh" in js.text
+    assert "/recovery" in js.text
+    assert "decided_by" in js.text
 
 
 def test_approval_queue_is_enriched_for_the_ui(client):
@@ -78,6 +82,12 @@ def test_approval_queue_is_enriched_for_the_ui(client):
     )
     assert decided.status_code == 200
     assert client.get("/approvals/queue").json() == []
+
+
+def test_recovery_endpoint_is_served(client):
+    assert client.get("/recovery").json() == []
+    task = client.post("/tasks", json=payload()).json()
+    assert client.get(f"/tasks/{task['task_id']}/events").status_code == 200
 
 
 def test_approval_queue_filters_status(client):

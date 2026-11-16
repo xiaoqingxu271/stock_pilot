@@ -10,26 +10,33 @@ Read-only endpoints expose task and approval state for the demo UI.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from stock_pilot import approval, tasks
+from stock_pilot import approval, audit, recovery, tasks
 from stock_pilot.agent import (
     build_graph,
     confirm_mapping_and_resume,
     decide_and_resume,
+    resume_task,
     start_task,
 )
 from stock_pilot.clients import ToolClient, create_tool_client
 from stock_pilot.config import Settings
-from stock_pilot.enums import ApprovalStatus, ErrorCode
+from stock_pilot.enums import (
+    ApprovalStatus,
+    ErrorCode,
+    StagingStatus,
+    TaskStatus,
+)
 from stock_pilot.errors import ToolFailure
 from stock_pilot.models import (
     ApprovalDecisionRequest,
@@ -37,9 +44,13 @@ from stock_pilot.models import (
     ApprovalView,
     CreateTaskRequest,
     MappingConfirmRequest,
+    RecoveryIssue,
     TaskView,
+    ToolEvent,
 )
 from stock_pilot.tools import StockPilotTools
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -48,6 +59,7 @@ _CONFLICT = {
     ErrorCode.APPROVAL_ALREADY_DECIDED,
     ErrorCode.INVALID_STATE,
     ErrorCode.PENDING_APPROVAL_EXISTS,
+    ErrorCode.IDEMPOTENCY_CONFLICT,
 }
 
 
@@ -78,6 +90,13 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        issues = recovery.scan(db_path)
+        if issues:
+            logger.warning(
+                "recovery scan found %d task(s) needing attention: %s",
+                len(issues),
+                ", ".join(f"{issue.task_id}:{issue.kind.value}" for issue in issues),
+            )
         yield
         closer = getattr(client, "close", None)
         if callable(closer):
@@ -102,9 +121,53 @@ def create_app(
     def approval_ui() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    def _replay_existing(existing: TaskView, request: CreateTaskRequest) -> TaskView:
+        if (
+            existing.sku_id != request.sku_id
+            or existing.spec != request.spec
+            or existing.target_price != request.target_price
+            or existing.reason != request.reason
+        ):
+            raise _http_error(
+                ToolFailure(
+                    ErrorCode.IDEMPOTENCY_CONFLICT,
+                    "Idempotency-Key was already used with a different request",
+                )
+            )
+        return existing
+
     @app.post("/tasks", response_model=TaskView, status_code=201)
-    def submit_task(request: CreateTaskRequest) -> TaskView:
-        return start_task(client, graph, request)
+    def submit_task(
+        request: CreateTaskRequest,
+        response: Response,
+        idempotency_key: str | None = Header(
+            default=None, alias="Idempotency-Key", max_length=128
+        ),
+    ) -> TaskView:
+        key = idempotency_key.strip() if idempotency_key is not None else None
+        if idempotency_key is not None and not key:
+            raise HTTPException(
+                status_code=400, detail="Idempotency-Key must not be blank"
+            )
+        if key is not None:
+            existing = tasks.find_task_by_idempotency_key(db_path, key)
+            if existing is not None:
+                response.status_code = 200
+                return _replay_existing(existing, request)
+        try:
+            return start_task(
+                client, graph, request, idempotency_key=key
+            )
+        except sqlite3.IntegrityError:
+            existing = (
+                tasks.find_task_by_idempotency_key(db_path, key)
+                if key is not None
+                else None
+            )
+            if existing is None:
+                raise
+            response.status_code = 200
+            return _replay_existing(existing, request)
 
     @app.get("/tasks", response_model=list[TaskView])
     def list_task_records(limit: int = Query(default=100, ge=1, le=500)):
@@ -116,6 +179,55 @@ def create_app(
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         return task
+
+    @app.get("/tasks/{task_id}/events", response_model=list[ToolEvent])
+    def get_task_events(task_id: str) -> list[ToolEvent]:
+        task = tasks.get_task(db_path, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return audit.list_tool_events(db_path, task_id)
+
+    @app.get("/recovery", response_model=list[RecoveryIssue])
+    def list_recovery_issues() -> list[RecoveryIssue]:
+        return recovery.scan(db_path)
+
+    @app.post("/tasks/{task_id}/recover", response_model=TaskView)
+    def recover_task(task_id: str) -> TaskView:
+        task = tasks.get_task(db_path, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        if task.status is not TaskStatus.AWAITING_APPROVAL:
+            raise _http_error(
+                ToolFailure(
+                    ErrorCode.INVALID_STATE,
+                    f"task is {task.status.value}, nothing to recover",
+                )
+            )
+        current = approval.get_approval(db_path, task.approval_id or "")
+        if current is None:
+            raise _http_error(
+                ToolFailure(
+                    ErrorCode.APPROVAL_NOT_FOUND,
+                    f"approval {task.approval_id!r} does not exist",
+                )
+            )
+        if current.status is ApprovalStatus.PENDING:
+            raise _http_error(
+                ToolFailure(
+                    ErrorCode.INVALID_STATE,
+                    "approval is still pending; use the decision endpoint",
+                )
+            )
+        if current.status is ApprovalStatus.APPROVED:
+            staged = approval.get_staging_for_approval(db_path, current.approval_id)
+            if staged is None or staged.status is not StagingStatus.PRICE_STAGED:
+                raise _http_error(
+                    ToolFailure(
+                        ErrorCode.STAGING_NOT_FOUND,
+                        "approved without a live staged proposal; manual review required",
+                    )
+                )
+        return resume_task(client, graph, task_id, {"recovered": True})
 
     @app.post("/tasks/{task_id}/mapping", response_model=TaskView)
     def confirm_mapping(task_id: str, request: MappingConfirmRequest) -> TaskView:
@@ -130,7 +242,12 @@ def create_app(
     def decide(approval_id: str, request: ApprovalDecisionRequest) -> TaskView:
         try:
             return decide_and_resume(
-                client, graph, approval_id, request.decision, request.note
+                client,
+                graph,
+                approval_id,
+                request.decision,
+                request.note,
+                request.decided_by,
             )
         except ToolFailure as exc:
             raise _http_error(exc) from exc

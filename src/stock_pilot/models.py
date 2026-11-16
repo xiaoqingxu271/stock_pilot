@@ -16,8 +16,10 @@ from stock_pilot.enums import (
     ListingResult,
     ListingStatus,
     PendingStage,
+    RecoveryKind,
     StagingStatus,
     TaskStatus,
+    ToolOutcome,
 )
 
 Money = Annotated[
@@ -48,7 +50,7 @@ class ToolOutput(BaseModel):
     message: str | None = None
 
     @classmethod
-    def fail(cls, code: ErrorCode, message: str) -> "ToolOutput":
+    def fail(cls, code: ErrorCode, message: str) -> ToolOutput:
         return cls(ok=False, error_code=code, message=message)
 
 
@@ -126,6 +128,7 @@ class ApprovalView(BaseModel):
     proposal_reason: str
     status: ApprovalStatus
     decision_note: str | None = None
+    decided_by: str | None = None
     created_at: datetime
     decided_at: datetime | None = None
     consumed_at: datetime | None = None
@@ -146,6 +149,7 @@ class ApprovalQueueItem(BaseModel):
     proposal_reason: str
     status: ApprovalStatus
     decision_note: str | None = None
+    decided_by: str | None = None
     created_at: datetime
     decided_at: datetime | None = None
 
@@ -211,6 +215,7 @@ class CreateTaskRequest(StrictModel):
 class ApprovalDecisionRequest(StrictModel):
     decision: ApprovalDecision
     note: str | None = Field(default=None, max_length=500)
+    decided_by: str | None = Field(default=None, max_length=64)
 
 
 class MappingConfirmRequest(StrictModel):
@@ -228,6 +233,7 @@ class TaskView(BaseModel):
     spec: str
     target_price: Money
     reason: str
+    idempotency_key: str | None = None
     status: TaskStatus
     listing_id: str | None = None
     approval_id: str | None = None
@@ -238,3 +244,34 @@ class TaskView(BaseModel):
     error_code: ErrorCode | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class ToolEvent(BaseModel):
+    """One attempt of one tool call, correlated with a task when known."""
+
+    event_id: int
+    task_id: str | None = None
+    tool: str
+    attempt: int
+    outcome: ToolOutcome
+    error_code: ErrorCode | None = None
+    latency_ms: int
+    created_at: datetime
+
+
+class RecoveryIssue(BaseModel):
+    """Read-only finding from the startup/restart reconciliation scan."""
+
+    kind: RecoveryKind
+    message: str
+    task_id: str
+    sku_id: str
+    spec: str
+    task_status: TaskStatus
+    target_price: Money
+    listing_id: str | None = None
+    listing_status: ListingStatus | None = None
+    listing_price: Money | None = None
+    approval_id: str | None = None
+    approval_status: ApprovalStatus | None = None
+    staging_status: StagingStatus | None = None

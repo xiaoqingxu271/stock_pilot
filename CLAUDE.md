@@ -80,6 +80,9 @@ python -m venv .venv
 # 全量验收回归
 ./.venv/Scripts/python.exe -m pytest -q
 
+# Lint
+./.venv/Scripts/python.exe -m ruff check src tests
+
 # 单条用例
 ./.venv/Scripts/python.exe -m pytest tests/test_agent_acceptance.py::test_happy_path_verified -q
 
@@ -107,15 +110,17 @@ STOCK_PILOT_TOOL_CLIENT=mcp ./.venv/Scripts/python.exe -m stock_pilot.api
 
 **数据层**
 
-- `db.py`：单个 SQLite 文件（WAL），三块 module 边界：`inventory_records`（库存）、`listings`/`staging`（商城）、`approvals`（审批），外加 `tasks` 审计记录。跨模块提交（改价 + 上架 + 消费审批）在同一个 `BEGIN IMMEDIATE` 事务内完成。
+- `db.py`：单个 SQLite 文件（WAL），三块 module 边界：`inventory_records`（库存）、`listings`/`staging`（商城）、`approvals`（审批），外加 `tasks` 审计记录和 `tool_events` 工具时间线。跨模块提交（改价 + 上架 + 消费审批）在同一个 `BEGIN IMMEDIATE` 事务内完成。
 - 金额统一用「分」存 SQLite，边界层用 `Decimal`；`models.to_cents/from_cents` 是唯一转换点。
 - `staging` 有部分唯一索引：每个 listing 最多存在一条 `price_staged` 提案。
+- 增量迁移在 `initialize_database` 内执行：补 `approvals.decided_by`、`tasks.idempotency_key` 与唯一索引，保证旧 demo 库可直接打开。
 
 **工具层**
 
 - `inventory.py` / `mall.py` / `approval.py`：纯业务函数；业务违规抛 `ToolFailure(ErrorCode)`，由 `tools.py` 转成 `ok=False` 的结构化输出。
-- `runner.py`：每次调用有硬超时；只读工具可重试，写工具只执行一次；每个工具独立熔断器（连续失败达阈值后打开，冷却后半开）。`ToolFailure` 不计入熔断。
-- `tools.py`：`StockPilotTools` 门面，把超时/熔断/内部异常统一映射为 `TOOL_TIMEOUT` / `CIRCUIT_OPEN` / `INTERNAL_ERROR`。
+- `runner.py`：每次调用有硬超时；只读工具可重试，写工具只执行一次；每个工具独立熔断器（连续失败达阈值后打开，冷却后半开）。`ToolFailure` 不计入熔断。每次尝试通过 `event_sink` 上报 `ToolOutcome` 与耗时；审计写失败不影响业务结果。
+- `audit.py`：`task_context()` 用 ContextVar 关联任务；`make_event_sink()` 把每次工具尝试写入 `tool_events`（`task_id / tool / attempt / outcome / error_code / latency_ms`），`GET /tasks/{id}/events` 读取。
+- `tools.py`：`StockPilotTools` 门面，把超时/熔断/内部异常统一映射为 `TOOL_TIMEOUT` / `TOOL_UNAVAILABLE` / `CIRCUIT_OPEN` / `INTERNAL_ERROR`。
 - `mcp_server.py`：MCP 2.x 中 `FastMCP` 已改名 `MCPServer`（`mcp.server.mcpserver`），不要再从 `mcp.server.fastmcp` 导入。工具用平铺参数接收，内部立即构造 Pydantic 输入模型，返回 Pydantic 输出模型（含 `outputSchema` / structuredContent）。
 
 **工具客户端边界（`clients.py`）**
@@ -133,12 +138,20 @@ STOCK_PILOT_TOOL_CLIENT=mcp ./.venv/Scripts/python.exe -m stock_pilot.api
 - 写超时后只做一次只读 `get_listing` 对账：改价超时看 `pending` 是否已落库并采纳 `approval_id`；上架超时看价格/状态是否已是目标值。对账失败则 `ABORTED_UNKNOWN_STATE`，绝不重发写操作。
 - 最终核对复用 `get_listing`，结果写入 `tasks.verification_json`；核对通过才进入 `VERIFIED`。
 - 歧义 SKU 在人工选定后仍会返回 ambiguous，因此候选 `ListingCandidate` 也带 `pending`，核对/对账通过已确认的 `listing_id` 在候选中定位，不靠猜。
+- `start_task` / `resume_task` 用 `audit.task_context()` 包裹 `graph.invoke`，为工具事件提供 `task_id`。
+- `decide_and_resume` 幂等：相同决策重复提交返回当前任务；「审批已决策但图未恢复」时直接 resume，这正是重启恢复路径。相反决策返回 `APPROVAL_ALREADY_DECIDED`。
+
+**重启与恢复（`recovery.py`）**
+
+- `recovery.scan()` 只读扫描 `received` / `awaiting_approval` / `published` 任务，联表审批、staging、listing，分类为 `approved_not_published`、`rejected_not_closed`、`published_verify_pending`、`approval_missing`、`approved_without_staging`、`interrupted_before_approval`。
+- 启动时 lifespan 打一条 warning 汇总；`GET /recovery` 返回明细，审批台显示「待恢复任务」面板。
+- `POST /tasks/{id}/recover` 只处理 `awaiting_approval` 且审批已决策的任务：用 `Command(resume=...)` 继续图。审批通过必须有活跃 `price_staged`，否则拒绝恢复。恢复不会新增写操作，只会执行已审批的 `publish_listing` 或回写 `rolled_back`。
 
 **服务层**
 
-- `api.py`：三个操作接口 `POST /tasks`、`POST /approvals/{approval_id}/decision`、`POST /tasks/{task_id}/mapping`；另有只读的 `GET /tasks`、`GET /tasks/{id}`、`GET /approvals`、`GET /approvals/{id}`、`GET /approvals/queue`（联表返回商品与任务上下文的待审批项）。
-- `tasks.py`：任务记录 CRUD 与 JSON 字段序列化。
-- `static/`：零构建的原生 HTML/CSS/JS 审批台，`GET /` 返回页面。页面每 5 秒自动刷新，审批备注草稿与映射选择在重绘时保留；拒绝必须填写原因。静态资源通过 `pyproject.toml` 的 `package-data` 打进 wheel。
+- `api.py`：操作接口 `POST /tasks`（支持 `Idempotency-Key`，冲突返回 `IDEMPOTENCY_CONFLICT`）、`POST /approvals/{approval_id}/decision`（可带 `decided_by`）、`POST /tasks/{task_id}/mapping`、`POST /tasks/{task_id}/recover`；只读接口 `GET /tasks`、`GET /tasks/{id}`、`GET /tasks/{id}/events`、`GET /recovery`、`GET /approvals`、`GET /approvals/{id}`、`GET /approvals/queue`（联表返回商品与任务上下文）。
+- `tasks.py`：任务记录 CRUD、`find_task_by_idempotency_key()` 与 JSON 字段序列化。
+- `static/`：零构建的原生 HTML/CSS/JS 审批台，`GET /` 返回页面。页面每 5 秒自动刷新，审批备注草稿、映射选择与审批人姓名在重绘时保留；拒绝必须填写原因；存在异常态任务时显示「待恢复任务」面板。静态资源通过 `pyproject.toml` 的 `package-data` 打进 wheel。
 
 **演示数据（`db.py:_seed_demo_data`）**
 
@@ -156,7 +169,8 @@ STOCK_PILOT_TOOL_CLIENT=mcp ./.venv/Scripts/python.exe -m stock_pilot.api
 - `tests/test_api.py`：三个 FastAPI 操作接口及错误码。
 - `tests/test_ui.py`：审批台静态资源、页面入口、审批队列联表数据与状态过滤。
 - `tests/test_mcp_client.py`：真实 MCP stdio 客户端——四个工具契约、完整工具链、图与 FastAPI 跑在 MCP 模式、服务不可用 / 中途退出时安全终止且零后续写。
+- `tests/test_recovery.py`：进程重启后续审批/映射、恢复扫描与恢复接口、任务/审批幂等、操作者留痕、工具事件时间线。
 
 ## 实现状态
 
-工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、验收回归均已落地；`pytest -q` 当前 41 个用例通过。生产化拆分（库存/商城/审批各自独立 MCP Server、鉴权、审计日志、真实登录与操作者身份）尚未实现。
+工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复、任务/审批幂等、工具调用审计均已落地；`pytest -q` 当前 56 个用例通过，`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。生产化拆分（库存/商城/审批各自独立 MCP Server、鉴权、真实登录与角色、Postgres）尚未实现。

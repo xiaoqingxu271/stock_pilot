@@ -24,6 +24,10 @@
       </div>
     </div>
     <div class="topbar-actions">
+      <label class="operator-field">
+        <span>审批人</span>
+        <input id="operator-name" type="text" maxlength="64" placeholder="未署名" autocomplete="off" spellcheck="false">
+      </label>
       <span class="live" id="live-indicator" title="每 5 秒自动刷新">
         <span class="live-dot"></span>
         <span id="live-text">实时同步</span>
@@ -63,6 +67,17 @@
 
     <div class="grid">
       <div class="column">
+        <section class="panel" id="recovery-panel" aria-labelledby="recovery-title" hidden>
+          <div class="panel-head">
+            <div>
+              <h2 id="recovery-title">待恢复任务</h2>
+              <p class="panel-sub">进程中断后只做只读核对；已审批的提案可在此安全继续。</p>
+            </div>
+            <span class="count" id="recovery-count">0</span>
+          </div>
+          <div id="recovery-list" class="stack" aria-live="polite"></div>
+        </section>
+
         <section class="panel" aria-labelledby="approval-title">
           <div class="panel-head">
             <div>

@@ -30,9 +30,19 @@
     consumed: { label: "已提交", tone: "success" },
   };
 
+  const RECOVERY_KIND = {
+    approved_not_published: "已审批未提交",
+    rejected_not_closed: "已拒绝未关闭",
+    published_verify_pending: "已提交待核对",
+    approval_missing: "审批记录缺失",
+    approved_without_staging: "有效提案缺失",
+    interrupted_before_approval: "执行中断",
+  };
+
   const state = {
     approvals: [],
     tasks: [],
+    recovery: [],
     query: "",
     loading: false,
     mutating: 0,
@@ -48,6 +58,10 @@
     live: $("#live-indicator"),
     liveText: $("#live-text"),
     refresh: $("#refresh-btn"),
+    recoveryPanel: $("#recovery-panel"),
+    recoveryList: $("#recovery-list"),
+    recoveryCount: $("#recovery-count"),
+    operator: $("#operator-name"),
     approvalList: $("#approval-list"),
     approvalCount: $("#approval-count"),
     mappingList: $("#mapping-list"),
@@ -204,6 +218,84 @@
   }
 
   // ------------------------------------------------------------------
+  // Restart recovery
+  // ------------------------------------------------------------------
+
+  function recoveryCard(issue) {
+    const label = RECOVERY_KIND[issue.kind] || issue.kind;
+    const card = h("article", "recovery-card");
+
+    const head = h("div", "card-head");
+    const titleWrap = h("div");
+    titleWrap.append(
+      h("h3", "card-title", `${issue.sku_id} · ${issue.spec}`),
+      h("p", "card-meta", `${label} · task ${shortId(issue.task_id)}`)
+    );
+    head.append(titleWrap, h("span", "chip chip-warn", label));
+    card.append(head);
+
+    card.append(h("p", "recovery-message", issue.message));
+    card.append(
+      h(
+        "p",
+        "card-meta",
+        `当前 ${statusMeta(issue.task_status).label} · 目标 ${money(issue.target_price)} · listing ${
+          issue.listing_id || "—"
+        }`
+      )
+    );
+
+    const actions = h("div", "card-actions");
+    const recover = h("button", "btn btn-primary btn-small", "恢复执行");
+    recover.type = "button";
+    const recoverable = [
+      "approved_not_published",
+      "rejected_not_closed",
+      "published_verify_pending",
+    ].includes(issue.kind);
+    recover.disabled = !recoverable;
+    if (!recoverable) recover.title = "该状态需要人工核查，不能自动继续";
+    actions.append(recover);
+    card.append(actions);
+
+    let busy = false;
+    recover.addEventListener("click", async () => {
+      if (busy || !recoverable) return;
+      busy = true;
+      recover.disabled = true;
+      recover.textContent = "恢复中…";
+      state.mutating += 1;
+      try {
+        const updated = await api(
+          `/tasks/${encodeURIComponent(issue.task_id)}/recover`,
+          { method: "POST", body: "{}" }
+        );
+        toast(`恢复完成：${statusMeta(updated.status).label}`, outcomeKind(updated.status));
+        await refresh({ force: true });
+      } catch (error) {
+        toast(error.message, "error");
+        recover.disabled = false;
+        recover.textContent = "恢复执行";
+      } finally {
+        state.mutating -= 1;
+        busy = false;
+      }
+    });
+
+    return card;
+  }
+
+  function renderRecovery() {
+    const issues = state.recovery;
+    refs.recoveryPanel.hidden = issues.length === 0;
+    refs.recoveryCount.textContent = String(issues.length);
+    refs.recoveryList.replaceChildren();
+    issues.forEach((issue) =>
+      refs.recoveryList.append(recoveryCard(issue))
+    );
+  }
+
+  // ------------------------------------------------------------------
   // Approval cards
   // ------------------------------------------------------------------
 
@@ -310,7 +402,11 @@
           `/approvals/${encodeURIComponent(item.approval_id)}/decision`,
           {
             method: "POST",
-            body: JSON.stringify({ decision, note: text || null }),
+            body: JSON.stringify({
+              decision,
+              note: text || null,
+              decided_by: refs.operator.value.trim() || null,
+            }),
           }
         );
         draftNotes.delete(item.approval_id);
@@ -662,10 +758,15 @@
       state.pendingRender = true;
       return;
     }
-    const signature = JSON.stringify([state.approvals, state.tasks]);
+    const signature = JSON.stringify([
+      state.approvals,
+      state.tasks,
+      state.recovery,
+    ]);
     if (!force && signature === state.lastSignature) return;
     state.lastSignature = signature;
     renderStats();
+    renderRecovery();
     renderApprovals();
     renderMappings();
     renderTasks();
@@ -675,12 +776,14 @@
     if (state.loading) return;
     state.loading = true;
     try {
-      const [approvals, tasks] = await Promise.all([
+      const [approvals, tasks, recovery] = await Promise.all([
         api("/approvals/queue"),
         api("/tasks?limit=100"),
+        api("/recovery"),
       ]);
       state.approvals = Array.isArray(approvals) ? approvals : [];
       state.tasks = Array.isArray(tasks) ? tasks : [];
+      state.recovery = Array.isArray(recovery) ? recovery : [];
       state.lastUpdated = new Date();
       render(force);
       updateLive(true);
@@ -774,6 +877,22 @@
     });
   }
 
+  function bindOperator() {
+    const key = "stockPilotOperator";
+    try {
+      refs.operator.value = window.localStorage.getItem(key) || "";
+    } catch {
+      // Storage may be unavailable; the field still works for this page.
+    }
+    refs.operator.addEventListener("input", () => {
+      try {
+        window.localStorage.setItem(key, refs.operator.value.trim());
+      } catch {
+        // Ignore storage failures.
+      }
+    });
+  }
+
   function bindGlobal() {
     refs.refresh.addEventListener("click", () => refresh({ manual: true, force: true }));
 
@@ -798,6 +917,7 @@
   bindForm();
   bindScenarios();
   bindFilter();
+  bindOperator();
   bindGlobal();
   refresh({ manual: true });
 })();

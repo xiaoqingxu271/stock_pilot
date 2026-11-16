@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 from stock_pilot.config import Settings
+from stock_pilot.enums import ErrorCode, ToolOutcome
 from stock_pilot.errors import (
     CircuitOpenError,
     ToolExecutionError,
@@ -41,11 +43,32 @@ class ToolExecutor:
         self,
         settings: Settings,
         executor: Executor | None = None,
+        event_sink: Callable[
+            [str, int, ToolOutcome, ErrorCode | None, int], None
+        ]
+        | None = None,
     ) -> None:
         self._settings = settings
         self._executor = executor or _DEFAULT_EXECUTOR
         self._lock = threading.Lock()
         self._circuits: dict[str, _CircuitState] = {}
+        self._event_sink = event_sink
+
+    def _emit(
+        self,
+        name: str,
+        attempt: int,
+        outcome: ToolOutcome,
+        code: ErrorCode | None,
+        started_at: float,
+    ) -> None:
+        if self._event_sink is None:
+            return
+        latency_ms = (time.monotonic() - started_at) * 1000
+        try:
+            self._event_sink(name, attempt, outcome, code, int(latency_ms))
+        except Exception:  # noqa: BLE001 - audit must not break the call
+            pass
 
     def _state(self, name: str) -> _CircuitState:
         with self._lock:
@@ -96,36 +119,77 @@ class ToolExecutor:
 
         last_error: ToolTimeoutError | None = None
         for attempt in range(attempts):
-            self._ensure_closed(name)
+            attempt_no = attempt + 1
+            started_at = time.monotonic()
+            try:
+                self._ensure_closed(name)
+            except CircuitOpenError:
+                self._emit(
+                    name,
+                    attempt_no,
+                    ToolOutcome.CIRCUIT_OPEN,
+                    ErrorCode.CIRCUIT_OPEN,
+                    started_at,
+                )
+                raise
             try:
                 future = self._executor.submit(fn, *args, **kwargs)
                 result = future.result(timeout=deadline)
             except FuturesTimeoutError:
                 self._record_failure(name)
+                self._emit(
+                    name,
+                    attempt_no,
+                    ToolOutcome.TIMEOUT,
+                    ErrorCode.TOOL_TIMEOUT,
+                    started_at,
+                )
                 last_error = ToolTimeoutError(
                     f"tool '{name}' timed out after {deadline:.2f}s"
                 )
                 if attempt + 1 < attempts:
                     continue
-                raise last_error
-            except ToolFailure:
+                raise last_error from None
+            except ToolFailure as exc:
                 # Deterministic business rule violation: retrying cannot help,
                 # and it must not trip the transport circuit breaker.
+                self._emit(
+                    name,
+                    attempt_no,
+                    ToolOutcome.BUSINESS_ERROR,
+                    exc.code,
+                    started_at,
+                )
                 raise
             except ToolUnavailableError:
                 # Transport down: retry reads, then surface as unavailable so
                 # the orchestrator can stop without further writes.
                 self._record_failure(name)
+                self._emit(
+                    name,
+                    attempt_no,
+                    ToolOutcome.UNAVAILABLE,
+                    ErrorCode.TOOL_UNAVAILABLE,
+                    started_at,
+                )
                 if attempt + 1 < attempts:
                     continue
                 raise
             except Exception as exc:  # noqa: BLE001 - converted to structured error
                 self._record_failure(name)
+                self._emit(
+                    name,
+                    attempt_no,
+                    ToolOutcome.ERROR,
+                    ErrorCode.INTERNAL_ERROR,
+                    started_at,
+                )
                 if attempt + 1 < attempts:
                     continue
                 raise ToolExecutionError(f"tool '{name}' failed: {exc}", exc) from exc
             else:
                 self._record_success(name)
+                self._emit(name, attempt_no, ToolOutcome.OK, None, started_at)
                 return result
 
         # Unreachable: loop either returns or raises.

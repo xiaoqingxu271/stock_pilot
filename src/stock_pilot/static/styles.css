@@ -126,6 +126,29 @@ a { color: var(--accent); }
   gap: 10px;
 }
 
+.operator-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.operator-field input {
+  width: 96px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.operator-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+}
+
 .live {
   display: inline-flex;
   align-items: center;
@@ -346,6 +369,24 @@ a { color: var(--accent); }
   background: linear-gradient(180deg, #ffffff 0%, var(--surface-soft) 100%);
   animation: rise-in 0.28s ease both;
 }
+
+.recovery-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid #fde68a;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, #fffdf6 0%, var(--warn-soft) 100%);
+  animation: rise-in 0.28s ease both;
+}
+
+.recovery-message {
+  font-size: 13px;
+  color: #78350f;
+}
+
+.recovery-card .card-meta { margin-top: 0; }
 
 @keyframes rise-in {
   from { opacity: 0; transform: translateY(5px); }
@@ -1032,11 +1073,14 @@ a { color: var(--accent); }
   .brand-text p { display: none; }
   .live span:last-child { display: none; }
   .live { padding: 7px; }
+  .topbar-actions { flex-wrap: wrap; justify-content: flex-end; }
   .panel { padding: 16px; }
 }
 
 @media (max-width: 480px) {
   .field-grid { grid-template-columns: 1fr; }
+  .operator-field span { display: none; }
+  .operator-field input { width: 78px; }
   .card-actions { flex-direction: column; }
   .form-actions { align-items: flex-start; flex-direction: column; }
   .stats strong { font-size: 26px; }

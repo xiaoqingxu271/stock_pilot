@@ -26,6 +26,7 @@ class ErrorCode(str, Enum):
     STAGING_NOT_FOUND = "STAGING_NOT_FOUND"
     LISTING_PRICE_CHANGED = "LISTING_PRICE_CHANGED"
     INVALID_STATE = "INVALID_STATE"
+    IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
 
     # Execution failures
     TOOL_TIMEOUT = "TOOL_TIMEOUT"
@@ -74,6 +75,26 @@ class PendingStage(str, Enum):
 
     PRICE_STAGED = "price_staged"
     PUBLISH_PENDING = "publish_pending"
+
+
+class RecoveryKind(str, Enum):
+    """Why a non-terminal task needs attention after a restart."""
+
+    APPROVED_NOT_PUBLISHED = "approved_not_published"
+    REJECTED_NOT_CLOSED = "rejected_not_closed"
+    PUBLISHED_VERIFY_PENDING = "published_verify_pending"
+    APPROVAL_MISSING = "approval_missing"
+    APPROVED_WITHOUT_STAGING = "approved_without_staging"
+    INTERRUPTED_BEFORE_APPROVAL = "interrupted_before_approval"
+
+
+class ToolOutcome(str, Enum):
+    OK = "ok"
+    BUSINESS_ERROR = "business_error"
+    TIMEOUT = "timeout"
+    UNAVAILABLE = "unavailable"
+    CIRCUIT_OPEN = "circuit_open"
+    ERROR = "error"
 
 
 class TaskStatus(str, Enum):

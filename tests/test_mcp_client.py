@@ -179,6 +179,16 @@ def test_api_runs_through_mcp_client(
         assert decided.status_code == 200
         assert decided.json()["status"] == "verified"
 
+        events = client.get(f"/tasks/{task['task_id']}/events").json()
+        assert [event["tool"] for event in events] == [
+            "check_inventory",
+            "get_listing",
+            "update_price",
+            "publish_listing",
+            "get_listing",
+        ]
+        assert all(event["outcome"] == "ok" for event in events)
+
     row = fetch_one(
         settings, "SELECT price_cents, status FROM listings WHERE id = 'LST-001'"
     )

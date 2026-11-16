@@ -11,6 +11,7 @@ import logging
 from typing import TypeVar, cast
 
 from stock_pilot import approval, inventory, mall
+from stock_pilot.audit import make_event_sink
 from stock_pilot.config import Settings
 from stock_pilot.db import initialize_database
 from stock_pilot.enums import ErrorCode
@@ -48,7 +49,10 @@ class StockPilotTools:
     ) -> None:
         self.settings = settings or Settings.from_env()
         initialize_database(self.settings.db_path, seed=seed)
-        self.executor = executor or ToolExecutor(self.settings)
+        self.executor = executor or ToolExecutor(
+            self.settings,
+            event_sink=make_event_sink(self.settings.db_path),
+        )
 
     def _run(
         self,
@@ -123,9 +127,9 @@ class StockPilotTools:
 
     # -- human approval queue (not MCP tools) -----------------------------
 
-    def decide_approval(self, approval_id, decision, note=None):
+    def decide_approval(self, approval_id, decision, note=None, decided_by=None):
         return approval.decide_approval(
-            self.settings.db_path, approval_id, decision, note
+            self.settings.db_path, approval_id, decision, note, decided_by
         )
 
     def get_approval(self, approval_id):

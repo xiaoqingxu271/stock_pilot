@@ -18,7 +18,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from stock_pilot import tasks
+from stock_pilot import audit, tasks
 from stock_pilot.clients import ToolClient
 from stock_pilot.db import utcnow
 from stock_pilot.enums import (
@@ -552,19 +552,38 @@ def thread_config(task_id: str) -> dict[str, Any]:
     return {"configurable": {"thread_id": task_id}}
 
 
-def start_task(client: ToolClient, graph, request: CreateTaskRequest) -> TaskView:
-    task = tasks.create_task(client.settings.db_path, request)
-    graph.invoke(initial_state(task), thread_config(task.task_id))
+def start_task(
+    client: ToolClient,
+    graph,
+    request: CreateTaskRequest,
+    *,
+    idempotency_key: str | None = None,
+) -> TaskView:
+    task = tasks.create_task(
+        client.settings.db_path, request, idempotency_key=idempotency_key
+    )
+    with audit.task_context(task.task_id):
+        graph.invoke(initial_state(task), thread_config(task.task_id))
     refreshed = tasks.get_task(client.settings.db_path, task.task_id)
     assert refreshed is not None
     return refreshed
 
 
 def resume_task(client: ToolClient, graph, task_id: str, value: Any) -> TaskView:
-    graph.invoke(Command(resume=value), thread_config(task_id))
+    with audit.task_context(task_id):
+        graph.invoke(Command(resume=value), thread_config(task_id))
     refreshed = tasks.get_task(client.settings.db_path, task_id)
     assert refreshed is not None
     return refreshed
+
+
+def _approval_matches_decision(approval, decision: ApprovalDecision) -> bool:
+    if decision is ApprovalDecision.APPROVE:
+        return approval.status in (
+            ApprovalStatus.APPROVED,
+            ApprovalStatus.CONSUMED,
+        )
+    return approval.status is ApprovalStatus.REJECTED
 
 
 def decide_and_resume(
@@ -573,19 +592,41 @@ def decide_and_resume(
     approval_id: str,
     decision: ApprovalDecision,
     note: str | None = None,
+    decided_by: str | None = None,
 ) -> TaskView:
+    approval = client.get_approval(approval_id)
+    if approval is None:
+        raise ToolFailure(
+            ErrorCode.APPROVAL_NOT_FOUND,
+            f"approval {approval_id!r} does not exist",
+        )
     task = tasks.find_task_by_approval(client.settings.db_path, approval_id)
     if task is None:
         raise ToolFailure(
             ErrorCode.APPROVAL_NOT_FOUND,
             f"no task is waiting on approval {approval_id!r}",
         )
+
     if task.status is not TaskStatus.AWAITING_APPROVAL:
+        # Idempotent replay: replaying the decision that already finished
+        # returns the current task instead of an error.
+        if _approval_matches_decision(approval, decision):
+            return task
         raise ToolFailure(
             ErrorCode.INVALID_STATE,
             f"task is {task.status.value}, not awaiting approval",
         )
-    client.decide_approval(approval_id, decision, note)
+
+    if approval.status is ApprovalStatus.PENDING:
+        client.decide_approval(approval_id, decision, note, decided_by)
+    elif not _approval_matches_decision(approval, decision):
+        raise ToolFailure(
+            ErrorCode.APPROVAL_ALREADY_DECIDED,
+            f"approval {approval_id!r} is already {approval.status.value}",
+        )
+    # Otherwise the decision is already recorded (for example the process
+    # died between recording it and resuming the graph): just resume.
+
     return resume_task(
         client,
         graph,

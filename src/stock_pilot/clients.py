@@ -21,6 +21,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from stock_pilot import approval as approval_queue
+from stock_pilot.audit import make_event_sink
 from stock_pilot.config import PROJECT_ROOT, Settings
 from stock_pilot.db import initialize_database
 from stock_pilot.enums import ApprovalDecision, ErrorCode
@@ -69,6 +70,7 @@ class ToolClient(Protocol):
         approval_id: str,
         decision: ApprovalDecision,
         note: str | None = None,
+        decided_by: str | None = None,
     ) -> ApprovalView: ...
 
 
@@ -101,7 +103,9 @@ class MCPToolClient:
         # The orchestrator owns the task/approval DB even when tool calls go
         # over MCP. Make sure the schema exists before the server starts.
         initialize_database(settings.db_path)
-        self._executor = ToolExecutor(settings)
+        self._executor = ToolExecutor(
+            settings, event_sink=make_event_sink(settings.db_path)
+        )
         self._call_lock = threading.Lock()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -184,7 +188,7 @@ class MCPToolClient:
         except RuntimeError:
             pass
 
-    def __enter__(self) -> "MCPToolClient":
+    def __enter__(self) -> MCPToolClient:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -347,7 +351,8 @@ class MCPToolClient:
         approval_id: str,
         decision: ApprovalDecision,
         note: str | None = None,
+        decided_by: str | None = None,
     ) -> ApprovalView:
         return approval_queue.decide_approval(
-            self.settings.db_path, approval_id, decision, note
+            self.settings.db_path, approval_id, decision, note, decided_by
         )

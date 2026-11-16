@@ -18,19 +18,26 @@ from stock_pilot.models import (
 )
 
 
-def create_task(db_path: str, request: CreateTaskRequest) -> TaskView:
+def create_task(
+    db_path: str,
+    request: CreateTaskRequest,
+    *,
+    idempotency_key: str | None = None,
+) -> TaskView:
     task_id = new_id("task")
     now = iso(utcnow())
     with transaction(db_path) as tx:
         tx.execute(
             "INSERT INTO tasks (id, sku_id, spec, target_price_cents, reason,"
-            " status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " idempotency_key, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 request.sku_id,
                 request.spec,
                 to_cents(request.target_price),
                 request.reason,
+                idempotency_key,
                 TaskStatus.RECEIVED.value,
                 now,
                 now,
@@ -39,6 +46,19 @@ def create_task(db_path: str, request: CreateTaskRequest) -> TaskView:
     task = get_task(db_path, task_id)
     assert task is not None
     return task
+
+
+def find_task_by_idempotency_key(
+    db_path: str, idempotency_key: str
+) -> TaskView | None:
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return _row_to_task(row) if row is not None else None
 
 
 def get_task(db_path: str, task_id: str) -> TaskView | None:
@@ -149,6 +169,7 @@ def _row_to_task(row: sqlite3.Row) -> TaskView:
         spec=row["spec"],
         target_price=from_cents(row["target_price_cents"]),
         reason=row["reason"],
+        idempotency_key=row["idempotency_key"],
         status=TaskStatus(row["status"]),
         listing_id=row["listing_id"],
         approval_id=row["approval_id"],

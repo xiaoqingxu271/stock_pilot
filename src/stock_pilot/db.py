@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS inventory_records (
@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     proposal_reason      TEXT NOT NULL,
     status               TEXT NOT NULL,
     decision_note        TEXT,
+    decided_by           TEXT,
     created_at           TEXT NOT NULL,
     decided_at           TEXT,
     consumed_at          TEXT
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     spec                 TEXT NOT NULL,
     target_price_cents   INTEGER NOT NULL,
     reason               TEXT NOT NULL,
+    idempotency_key      TEXT,
     status               TEXT NOT NULL,
     listing_id           TEXT,
     approval_id          TEXT,
@@ -85,6 +87,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+
+CREATE TABLE IF NOT EXISTS tool_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     TEXT,
+    tool        TEXT NOT NULL,
+    attempt     INTEGER NOT NULL,
+    outcome     TEXT NOT NULL,
+    error_code  TEXT,
+    latency_ms  INTEGER NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_events_task ON tool_events(task_id, id);
 """
 
 
@@ -120,6 +134,7 @@ def initialize_database(db_path: str, *, seed: bool = True) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         count = conn.execute(
             "SELECT COUNT(*) AS n FROM inventory_records"
         ).fetchone()["n"]
@@ -129,6 +144,29 @@ def initialize_database(db_path: str, *, seed: bool = True) -> None:
     if seed and count == 0:
         with transaction(db_path) as tx:
             _seed_demo_data(tx)
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+
+
+def _ensure_column(
+    conn: sqlite3.Connection, table: str, column: str, ddl: str
+) -> None:
+    if column not in _column_names(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive migrations so an existing demo database keeps working."""
+    _ensure_column(conn, "approvals", "decided_by", "decided_by TEXT")
+    _ensure_column(conn, "tasks", "idempotency_key", "idempotency_key TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_idempotency_key"
+        " ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL"
+    )
 
 
 def _seed_demo_data(conn: sqlite3.Connection) -> None:

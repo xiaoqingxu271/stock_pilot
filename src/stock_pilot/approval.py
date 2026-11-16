@@ -31,6 +31,7 @@ def _approval_view(row: sqlite3.Row) -> ApprovalView:
         proposal_reason=row["proposal_reason"],
         status=ApprovalStatus(row["status"]),
         decision_note=row["decision_note"],
+        decided_by=row["decided_by"],
         created_at=parse_dt(row["created_at"]),
         decided_at=parse_dt(row["decided_at"]) if row["decided_at"] else None,
         consumed_at=parse_dt(row["consumed_at"]) if row["consumed_at"] else None,
@@ -99,7 +100,7 @@ def list_queue(
         "SELECT a.id AS approval_id, t.id AS task_id, a.listing_id,"
         " l.sku_id, l.title, l.spec, l.price_cents AS current_price_cents,"
         " a.original_price_cents, a.new_price_cents, a.proposal_reason,"
-        " a.status, a.decision_note, a.created_at, a.decided_at"
+        " a.status, a.decision_note, a.decided_by, a.created_at, a.decided_at"
         " FROM approvals a"
         " JOIN listings l ON l.id = a.listing_id"
         " LEFT JOIN ("
@@ -134,6 +135,7 @@ def list_queue(
             proposal_reason=row["proposal_reason"],
             status=ApprovalStatus(row["status"]),
             decision_note=row["decision_note"],
+            decided_by=row["decided_by"],
             created_at=parse_dt(row["created_at"]),
             decided_at=(
                 parse_dt(row["decided_at"]) if row["decided_at"] else None
@@ -148,6 +150,7 @@ def decide_approval(
     approval_id: str,
     decision: ApprovalDecision,
     note: str | None = None,
+    decided_by: str | None = None,
 ) -> ApprovalView:
     """Record a human decision.
 
@@ -155,6 +158,13 @@ def decide_approval(
     staged proposal so no "price changed but not published" state can exist.
     """
     now = iso(utcnow())
+    operator = decided_by.strip() if decided_by is not None else None
+    if operator == "":
+        operator = None
+    if operator is not None and len(operator) > 64:
+        raise ToolFailure(
+            ErrorCode.VALIDATION_ERROR, "decided_by must be at most 64 characters"
+        )
 
     with transaction(db_path) as tx:
         row = tx.execute(
@@ -173,15 +183,15 @@ def decide_approval(
 
         if decision is ApprovalDecision.APPROVE:
             tx.execute(
-                "UPDATE approvals SET status = ?, decision_note = ?, decided_at = ?"
-                " WHERE id = ?",
-                (ApprovalStatus.APPROVED.value, note, now, approval_id),
+                "UPDATE approvals SET status = ?, decision_note = ?, decided_by = ?,"
+                " decided_at = ? WHERE id = ?",
+                (ApprovalStatus.APPROVED.value, note, operator, now, approval_id),
             )
         else:
             tx.execute(
-                "UPDATE approvals SET status = ?, decision_note = ?, decided_at = ?"
-                " WHERE id = ?",
-                (ApprovalStatus.REJECTED.value, note, now, approval_id),
+                "UPDATE approvals SET status = ?, decision_note = ?, decided_by = ?,"
+                " decided_at = ? WHERE id = ?",
+                (ApprovalStatus.REJECTED.value, note, operator, now, approval_id),
             )
             tx.execute(
                 "UPDATE staging SET status = ?, updated_at = ?"
