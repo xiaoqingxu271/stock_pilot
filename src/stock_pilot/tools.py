@@ -125,6 +125,11 @@ class StockPilotTools:
             is_write=True,
         )
 
+    # -- health ------------------------------------------------------------
+
+    def is_available(self) -> bool:
+        return True
+
     # -- human approval queue (not MCP tools) -----------------------------
 
     def decide_approval(self, approval_id, decision, note=None, decided_by=None):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -226,6 +226,10 @@ class MappingConfirmRequest(StrictModel):
     listing_id: ShortText
 
 
+class AbandonApprovalRequest(StrictModel):
+    reason: str = Field(default="人工清理遗留提案", min_length=1, max_length=500)
+
+
 class TaskVerification(BaseModel):
     result: VerificationResult
     verified_at: datetime
@@ -261,6 +265,17 @@ class ToolEvent(BaseModel):
     error_code: ErrorCode | None = None
     latency_ms: int
     created_at: datetime
+
+
+class HealthStatus(BaseModel):
+    """Readiness snapshot; degraded means writes must not be accepted."""
+
+    status: Literal["ok", "degraded"]
+    database: bool
+    tool_client: bool
+    pending_approvals: int
+    recovery_issues: int
+    checked_at: datetime
 
 
 class RecoveryIssue(BaseModel):

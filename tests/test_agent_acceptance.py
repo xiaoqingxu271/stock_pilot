@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from decimal import Decimal
 
 import pytest
@@ -74,6 +75,25 @@ class RecheckTimeout(_Proxy):
         if self.checks == 1:
             return self._inner.check_inventory(request)
         return CheckInventoryOutput.fail(ErrorCode.TOOL_TIMEOUT, "simulated timeout")
+
+
+class StaleInventoryRecheck(_Proxy):
+    """The recheck lies (reports stock) while the DB row is already depleted."""
+
+    def __init__(self, inner: StockPilotTools) -> None:
+        super().__init__(inner)
+        self.checks = 0
+
+    def check_inventory(self, request):
+        self.checks += 1
+        if self.checks == 1:
+            return self._inner.check_inventory(request)
+        return CheckInventoryOutput(
+            sku_id=request.sku_id,
+            spec=request.spec,
+            quantity=5,
+            inventory_record_id="INV-001",
+        )
 
 
 class PublishTimeout(_Proxy):
@@ -343,4 +363,41 @@ def test_recheck_timeout_stops_before_publish(
     assert "发布前库存复核失败" in record.abandon_reason
 
     # Failure to verify stock withdraws the proposal; no dirty staging.
+    assert recovery.scan(settings.db_path) == []
+
+
+def test_publish_transaction_rechecks_stock_inside_the_commit(
+    tools, checkpointer, settings: Settings
+):
+    """The recheck can be stale; the commit itself must not trust it."""
+    flaky = StaleInventoryRecheck(tools)
+    graph = build_graph(flaky, checkpointer)
+
+    task = start_task(flaky, graph, request())
+    assert task.status is TaskStatus.AWAITING_APPROVAL
+
+    with sqlite3.connect(settings.db_path) as conn:
+        conn.execute(
+            "UPDATE inventory_records SET quantity = 0 WHERE id = 'INV-001'"
+        )
+
+    done = decide_and_resume(
+        flaky, graph, task.approval_id, ApprovalDecision.APPROVE
+    )
+    assert done.status is TaskStatus.ROLLED_BACK
+    assert done.error_code is ErrorCode.INSUFFICIENT_STOCK
+
+    row = fetch_one(
+        settings, "SELECT price_cents, status FROM listings WHERE id = 'LST-001'"
+    )
+    assert row["price_cents"] == 7900
+    assert row["status"] == "draft"
+
+    staging = approval.get_staging_for_approval(settings.db_path, task.approval_id)
+    assert staging is not None
+    assert staging.status is StagingStatus.DISCARDED
+    record = approval.get_approval(settings.db_path, task.approval_id)
+    assert record is not None
+    assert record.status is ApprovalStatus.ABANDONED
+    assert "事务内库存校验" in record.abandon_reason
     assert recovery.scan(settings.db_path) == []

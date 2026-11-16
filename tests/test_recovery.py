@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from decimal import Decimal
 
 from conftest import count_rows, fetch_one
 from fastapi.testclient import TestClient
@@ -10,7 +11,7 @@ from fastapi.testclient import TestClient
 from stock_pilot import approval
 from stock_pilot.api import create_app
 from stock_pilot.config import Settings
-from stock_pilot.enums import ApprovalDecision, StagingStatus
+from stock_pilot.enums import ApprovalDecision, ApprovalStatus, StagingStatus
 from stock_pilot.models import ApprovalDecisionRequest
 
 
@@ -351,6 +352,168 @@ def test_recovery_reports_abandoned_but_not_closed(settings: Settings):
     )
     assert row["price_cents"] == 7900
     assert row["status"] == "draft"
+
+
+def test_recover_published_task_finishes_verification(settings: Settings):
+    with new_client(settings) as client:
+        task = submit(client)
+        decided = client.post(
+            f"/approvals/{task['approval_id']}/decision",
+            json={"decision": "approve"},
+        )
+        assert decided.json()["status"] == "verified"
+
+        # Simulate a crash after the mall commit but before verify wrote back.
+        with sqlite3.connect(settings.db_path) as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'published', final_price_cents = NULL,"
+                " verification_json = NULL WHERE id = ?",
+                (task["task_id"],),
+            )
+
+        issues = client.get("/recovery").json()
+        assert [issue["kind"] for issue in issues] == ["published_verify_pending"]
+
+        before = client.get(f"/tasks/{task['task_id']}/events").json()
+        recovered = client.post(f"/tasks/{task['task_id']}/recover")
+        assert recovered.status_code == 200
+        done = recovered.json()
+        assert done["status"] == "verified"
+        assert done["verification"]["result"]["matched"] is True
+        assert client.get("/recovery").json() == []
+
+        after = client.get(f"/tasks/{task['task_id']}/events").json()
+        assert [event["tool"] for event in after] == [
+            *[event["tool"] for event in before],
+            "get_listing",
+        ]
+        # Recovery never writes to the mall again.
+        assert "publish_listing" not in [event["tool"] for event in after[len(before):]]
+
+    row = fetch_one(
+        settings, "SELECT price_cents, status FROM listings WHERE id = 'LST-001'"
+    )
+    assert row["price_cents"] == 5900
+    assert row["status"] == "published"
+
+
+def test_recover_published_task_records_a_mismatch(settings: Settings):
+    with new_client(settings) as client:
+        task = submit(client)
+        client.post(
+            f"/approvals/{task['approval_id']}/decision",
+            json={"decision": "approve"},
+        )
+        with sqlite3.connect(settings.db_path) as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'published', final_price_cents = NULL,"
+                " verification_json = NULL WHERE id = ?",
+                (task["task_id"],),
+            )
+            conn.execute(
+                "UPDATE listings SET price_cents = 6000 WHERE id = 'LST-001'"
+            )
+
+        recovered = client.post(f"/tasks/{task['task_id']}/recover")
+        assert recovered.status_code == 200
+        done = recovered.json()
+        assert done["status"] == "failed_verification"
+        assert done["verification"]["result"]["matched"] is False
+        assert Decimal(str(done["verification"]["result"]["actual_price"])) == Decimal(
+            "60.00"
+        )
+
+
+def test_abandon_endpoint_clears_an_orphaned_proposal(settings: Settings):
+    with new_client(settings) as client:
+        task = submit(client)
+        approval.decide_approval(
+            settings.db_path,
+            task["approval_id"],
+            ApprovalDecision.APPROVE,
+            "同意",
+            "李四",
+        )
+        # Force the task out of a recoverable state while staging stays live.
+        with sqlite3.connect(settings.db_path) as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'aborted_unknown_state' WHERE id = ?",
+                (task["task_id"],),
+            )
+
+        issues = client.get("/recovery").json()
+        assert [issue["kind"] for issue in issues] == ["staging_orphaned"]
+        assert issues[0]["approval_id"] == task["approval_id"]
+
+        response = client.post(
+            f"/approvals/{task['approval_id']}/abandon",
+            json={"reason": "人工清理遗留提案"},
+        )
+        assert response.status_code == 200
+        record = response.json()
+        assert record["status"] == "abandoned"
+        assert record["abandon_reason"] == "人工清理遗留提案"
+        assert record["abandoned_at"] is not None
+        assert client.get("/recovery").json() == []
+
+    staging = approval.get_staging_for_approval(settings.db_path, task["approval_id"])
+    assert staging is not None
+    assert staging.status is StagingStatus.DISCARDED
+
+    row = fetch_one(
+        settings, "SELECT price_cents, status FROM listings WHERE id = 'LST-001'"
+    )
+    assert row["price_cents"] == 7900
+    assert row["status"] == "draft"
+
+
+def test_abandon_refuses_when_the_mall_already_committed(settings: Settings):
+    with new_client(settings) as client:
+        task = submit(client)
+        approval.decide_approval(
+            settings.db_path,
+            task["approval_id"],
+            ApprovalDecision.APPROVE,
+            "同意",
+            "李四",
+        )
+        # The mall is already at the proposed price/status, but the approval
+        # was never consumed: discarding staging now would lie about reality.
+        with sqlite3.connect(settings.db_path) as conn:
+            conn.execute(
+                "UPDATE listings SET price_cents = 5900, status = 'published'"
+                " WHERE id = 'LST-001'"
+            )
+
+        response = client.post(
+            f"/approvals/{task['approval_id']}/abandon", json={}
+        )
+        assert response.status_code == 409
+        assert "already committed" in response.json()["detail"]
+
+    record = approval.get_approval(settings.db_path, task["approval_id"])
+    assert record is not None
+    assert record.status is not ApprovalStatus.ABANDONED
+    staging = approval.get_staging_for_approval(settings.db_path, task["approval_id"])
+    assert staging is not None
+    assert staging.status is StagingStatus.PRICE_STAGED
+
+
+def test_abandon_endpoint_rejects_unknown_or_pending_approvals(settings: Settings):
+    with new_client(settings) as client:
+        assert (
+            client.post("/approvals/apr_missing/abandon", json={}).status_code == 404
+        )
+
+        task = submit(client)
+        response = client.post(
+            f"/approvals/{task['approval_id']}/abandon", json={}
+        )
+        assert response.status_code == 409
+
+    staging = approval.get_staging_for_approval(settings.db_path, task["approval_id"])
+    assert staging is not None
+    assert staging.status is StagingStatus.PRICE_STAGED
 
 
 def test_decision_request_model_exposes_operator():

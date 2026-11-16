@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from stock_pilot.api import create_app
 from stock_pilot.config import Settings
+from stock_pilot.tools import StockPilotTools
 
 
 @pytest.fixture
@@ -173,3 +174,40 @@ def test_api_errors(client):
 def test_api_validation_rejects_negative_price(client):
     response = client.post("/tasks", json=payload(price="-1"))
     assert response.status_code == 422
+
+
+def test_healthz_reports_readiness_and_queue_depth(client):
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["database"] is True
+    assert body["tool_client"] is True
+    assert body["pending_approvals"] == 0
+    assert body["recovery_issues"] == 0
+
+    client.post("/tasks", json=payload())
+    assert client.get("/healthz").json()["pending_approvals"] == 1
+
+
+def test_healthz_reports_degraded_when_the_tool_client_is_down(settings: Settings):
+    class Down:
+        def __init__(self, inner: StockPilotTools) -> None:
+            self._inner = inner
+            self.settings = inner.settings
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def is_available(self) -> bool:
+            return False
+
+    inner = StockPilotTools(settings)
+    app = create_app(settings, tool_client=Down(inner))
+    with TestClient(app) as client:
+        response = client.get("/healthz")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "degraded"
+        assert body["tool_client"] is False
+        assert body["database"] is True

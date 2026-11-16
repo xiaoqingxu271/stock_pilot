@@ -62,6 +62,9 @@ class ToolClient(Protocol):
 
     def publish_listing(self, request: PublishListingInput) -> PublishListingOutput: ...
 
+    # Health probe used by readiness checks.
+    def is_available(self) -> bool: ...
+
     # Human approval plane (not MCP tools).
     def get_approval(self, approval_id: str) -> ApprovalView | None: ...
 
@@ -327,6 +330,9 @@ class MCPToolClient:
         return self._run(
             "publish_listing", request, PublishListingOutput, is_write=True
         )
+
+    def is_available(self) -> bool:
+        return not self._closed and self._session is not None
 
     # -- introspective helper for integration tests ----------------------
 

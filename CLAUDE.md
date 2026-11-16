@@ -47,7 +47,8 @@ check_inventory（只读）→ get_listing（只读）→ update_price（写，�
 6. **目标价来源**：调用方提交任务时给定 `sku_id`、`spec`、目标价、理由；Agent 只负责安全执行，不自主定价。
 7. **MCP 拓扑**：第一版一个 MCP Server，内部按 module 隔离库存 / 商城 / 审批三块数据；生产环境拆分方案留作面试说明。
 8. **发布前库存复核**：审批通过后、`publish_listing` 前用现有 `check_inventory` 再读一次。库存 ≤ 0 → 不提交商城，审批置 `abandoned` 并在同一事务丢弃 staging，任务 `ROLLED_BACK` / `INSUFFICIENT_STOCK`。复核工具失败同样撤回提案，避免「任务已终止但 staging 仍活跃」。
-9. **重启恢复与幂等**：审批状态以数据库为准，进程重启后可从 checkpoint 继续；`GET /recovery` 只读标注异常态，`POST /tasks/{id}/recover` 只恢复已决策未继续的任务；`Idempotency-Key` 与重复审批返回原结果。
+9. **重启恢复与幂等**：审批状态以数据库为准，进程重启后可从 checkpoint 继续；`GET /recovery` 只读标注异常态；`POST /tasks/{id}/recover` 对 `awaiting_approval` 任务继续图，对 `published` 任务只读补核对；`Idempotency-Key` 与重复审批返回原结果。
+10. **提交时兜底与人工清理**：`publish_listing` 在提交事务内再次校验库存（复核读数可能已过期），不足则整个事务回滚、零写入；写超时遗留的 `price_staged` 只由人工经 `POST /approvals/{id}/abandon` 清理，接口必须先只读对账，商城已提交则拒绝撤回。`GET /healthz` 暴露数据库与工具客户端就绪状态。
 
 ## 验收用例（至少 5 条，每次改动后回归）
 
@@ -128,7 +129,7 @@ STOCK_PILOT_TOOL_CLIENT=mcp ./.venv/Scripts/python.exe -m stock_pilot.api
 
 **工具客户端边界（`clients.py`）**
 
-- `ToolClient` 协议：编排层只依赖四个工具方法 + `get_approval` / `decide_approval`。`create_tool_client()` 按 `STOCK_PILOT_TOOL_CLIENT` 返回实现，默认 `StockPilotTools`（进程内），`mcp` 时返回 `MCPToolClient`。
+- `ToolClient` 协议：编排层只依赖四个工具方法 + `is_available` / `get_approval` / `abandon_approval` / `decide_approval`。`create_tool_client()` 按 `STOCK_PILOT_TOOL_CLIENT` 返回实现，默认 `StockPilotTools`（进程内），`mcp` 时返回 `MCPToolClient`。
 - `MCPToolClient`：后台线程跑 asyncio 事件循环，用官方 SDK 的 `stdio_client` + `ClientSession` 长期持有会话；子进程命令为 `sys.executable -m stock_pilot.mcp_server`，注入 `STOCK_PILOT_DB`、`PYTHONPATH=src`、`PYTHONUTF8=1`。
 - 同步调用经 `asyncio.run_coroutine_threadsafe` 投递，仍复用 `ToolExecutor`，因此客户端侧的超时 / 只读重试 / 写不重试 / 熔断语义与进程内模式一致。传输层失败映射为 `TOOL_UNAVAILABLE`（读会重试直至熔断），业务 `ok=False` 原样透传。
 - 审批队列读写与决策留在编排进程本地（审批台是人机管理面，不属于四个 MCP 工具）；`MCPToolClient` 构造时会先 `initialize_database()`，保证任务/审批表存在。
@@ -144,18 +145,21 @@ STOCK_PILOT_TOOL_CLIENT=mcp ./.venv/Scripts/python.exe -m stock_pilot.api
 - `start_task` / `resume_task` 用 `audit.task_context()` 包裹 `graph.invoke`，为工具事件提供 `task_id`。
 - `decide_and_resume` 幂等：相同决策重复提交返回当前任务；「审批已决策但图未恢复」时直接 resume，这正是重启恢复路径。相反决策返回 `APPROVAL_ALREADY_DECIDED`。
 - `recheck_stock`：审批通过后、`publish_listing` 前再调一次只读 `check_inventory`。库存 ≤ 0 → `abandon_approval`（本地事务：审批置 `abandoned` + staging 置 `discarded`）→ 任务 `ROLLED_BACK` / `INSUFFICIENT_STOCK`。复核工具失败同样不发布并撤回提案，任务 `ABORTED_UNKNOWN_STATE`；绝不留下已终止任务 + 活跃 staging。
+- `publish` 的提交事务内还有最后一道库存校验（见 `mall.publish_listing`）：复核读数可能过期，事务内库存 ≤ 0 时整体回滚；`agent` 收到 `INSUFFICIENT_STOCK` 后同样 `_abandon_proposal` 并落 `ROLLED_BACK`。
+- `verify_published_task()`：已提交但未写回核对结果的恢复路径，只读 `get_listing` + 写 `verification_json`，绝不再次调用 `publish_listing`；调用时同样用 `audit.task_context()` 关联工具事件。
 
 **重启与恢复（`recovery.py`）**
 
 - `recovery.scan()` 只读扫描 `received` / `awaiting_approval` / `published` 任务，联表审批、staging、listing，分类为 `approved_not_published`、`rejected_not_closed`、`abandoned_not_closed`、`published_verify_pending`、`approval_missing`、`approved_without_staging`、`interrupted_before_approval`；另扫描写超时后遗留的 `price_staged` 行，报告 `staging_orphaned`（只标注，不自动写）。
 - 启动时 lifespan 打一条 warning 汇总；`GET /recovery` 返回明细，审批台显示「待恢复任务」面板。
-- `POST /tasks/{id}/recover` 只处理 `awaiting_approval` 且审批已决策的任务：用 `Command(resume=...)` 继续图。审批通过必须有活跃 `price_staged`，否则拒绝恢复。恢复不会新增写操作，只会执行已审批的 `publish_listing` 或回写 `rolled_back`。
+- `POST /tasks/{id}/recover` 处理两类任务：`awaiting_approval` 且审批已决策时用 `Command(resume=...)` 继续图（审批通过必须有活跃 `price_staged`，否则拒绝恢复）；`published` 时调用 `verify_published_task()` 只读补做核对。其余状态返回 409。恢复不会新增写操作，只会执行已审批的 `publish_listing`、回写 `rolled_back` 或补核对。
+- 人工清理：`POST /approvals/{id}/abandon` 只接受 `approved`（`abandoned` 幂等）提案，先通过 `get_listing` 做只读对账；商城已是目标价且 `published` 时拒绝撤回，防止把已提交事实误判为遗留提案。对账失败也拒绝。
 
 **服务层**
 
-- `api.py`：操作接口 `POST /tasks`（支持 `Idempotency-Key`，冲突返回 `IDEMPOTENCY_CONFLICT`）、`POST /approvals/{approval_id}/decision`（可带 `decided_by`）、`POST /tasks/{task_id}/mapping`、`POST /tasks/{task_id}/recover`；只读接口 `GET /tasks`、`GET /tasks/{id}`、`GET /tasks/{id}/events`、`GET /recovery`、`GET /approvals`、`GET /approvals/{id}`、`GET /approvals/queue`（联表返回商品与任务上下文）。
+- `api.py`：操作接口 `POST /tasks`（支持 `Idempotency-Key`，冲突返回 `IDEMPOTENCY_CONFLICT`）、`POST /approvals/{approval_id}/decision`（可带 `decided_by`）、`POST /approvals/{approval_id}/abandon`、`POST /tasks/{task_id}/mapping`、`POST /tasks/{task_id}/recover`；只读接口 `GET /tasks`、`GET /tasks/{id}`、`GET /tasks/{id}/events`、`GET /recovery`、`GET /healthz`（数据库/工具客户端不可用时 503 + `degraded`）、`GET /approvals`、`GET /approvals/{id}`、`GET /approvals/queue`（联表返回商品与任务上下文）。
 - `tasks.py`：任务记录 CRUD、`find_task_by_idempotency_key()` 与 JSON 字段序列化。
-- `static/`：零构建的原生 HTML/CSS/JS 审批台，`GET /` 返回页面。页面每 5 秒自动刷新，审批备注草稿、映射选择与审批人姓名在重绘时保留；拒绝必须填写原因；存在异常态任务时显示「待恢复任务」面板。静态资源通过 `pyproject.toml` 的 `package-data` 打进 wheel。
+- `static/`：零构建的原生 HTML/CSS/JS 审批台，`GET /` 返回页面。页面每 5 秒自动刷新，审批备注草稿、映射选择与审批人姓名在重绘时保留；拒绝必须填写原因；存在异常态任务时显示「待恢复任务」面板，`published_verify_pending` 可补核对，`staging_orphaned` 提供「撤回遗留提案」按钮。静态资源通过 `pyproject.toml` 的 `package-data` 打进 wheel。
 
 **演示数据（`db.py:_seed_demo_data`）**
 
@@ -168,13 +172,13 @@ STOCK_PILOT_TOOL_CLIENT=mcp ./.venv/Scripts/python.exe -m stock_pilot.api
 ## 测试对应关系
 
 - `tests/test_tools_acceptance.py`：4 条验收用例的工具层断言 + MCP 工具注册。
-- `tests/test_agent_acceptance.py`：4 条验收用例的图编排断言，另含映射恢复、写超时对账、拒绝/超时后零后续写。
+- `tests/test_agent_acceptance.py`：4 条验收用例的图编排断言，另含映射恢复、写超时对账、拒绝/超时后零后续写、复核读数过期时提交事务内兜底。
 - `tests/test_runner.py`：超时重试、熔断、写不重试、业务失败不计入熔断。
-- `tests/test_api.py`：三个 FastAPI 操作接口及错误码。
+- `tests/test_api.py`：FastAPI 操作接口、错误码与 `/healthz` 就绪/降级。
 - `tests/test_ui.py`：审批台静态资源、页面入口、审批队列联表数据与状态过滤。
 - `tests/test_mcp_client.py`：真实 MCP stdio 客户端——四个工具契约、完整工具链、图与 FastAPI 跑在 MCP 模式、服务不可用 / 中途退出时安全终止且零后续写。
-- `tests/test_recovery.py`：进程重启后续审批/映射、恢复扫描与恢复接口、任务/审批幂等、操作者留痕、工具事件时间线、发布前库存复核与系统撤回。
+- `tests/test_recovery.py`：进程重启后续审批/映射、恢复扫描与恢复接口（含 `published` 只读补核对）、任务/审批幂等、操作者留痕、工具事件时间线、发布前库存复核与系统撤回、遗留提案人工撤回与拒绝条件。
 
 ## 实现状态
 
-工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复、任务/审批幂等、工具调用审计、发布前库存复核均已落地；`pytest -q` 当前 59 个用例通过，`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。生产化拆分（库存/商城/审批各自独立 MCP Server、鉴权、真实登录与角色、Postgres）尚未实现。
+工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复（含已提交任务补核对）、任务/审批幂等、工具调用审计、发布前与提交事务内库存复核、遗留提案人工清理、健康检查均已落地；`pytest -q` 当前 67 个用例通过，`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。生产化拆分（库存/商城/审批各自独立 MCP Server、鉴权、真实登录与角色、Postgres）尚未实现。

@@ -256,44 +256,86 @@
     );
 
     const actions = h("div", "card-actions");
-    const recover = h("button", "btn btn-primary btn-small", "恢复执行");
-    recover.type = "button";
     const recoverable =
-      issue.task_status === "awaiting_approval" &&
-      [
-        "approved_not_published",
-        "rejected_not_closed",
-        "abandoned_not_closed",
-        "published_verify_pending",
-      ].includes(issue.kind);
-    recover.disabled = !recoverable;
-    if (!recoverable) recover.title = "该状态需要人工核查，不能自动继续";
-    actions.append(recover);
-    card.append(actions);
+      (issue.task_status === "awaiting_approval" &&
+        [
+          "approved_not_published",
+          "rejected_not_closed",
+          "abandoned_not_closed",
+        ].includes(issue.kind)) ||
+      (issue.task_status === "published" &&
+        issue.kind === "published_verify_pending");
 
-    let busy = false;
-    recover.addEventListener("click", async () => {
-      if (busy || !recoverable) return;
-      busy = true;
-      recover.disabled = true;
-      recover.textContent = "恢复中…";
-      state.mutating += 1;
-      try {
-        const updated = await api(
-          `/tasks/${encodeURIComponent(issue.task_id)}/recover`,
-          { method: "POST", body: "{}" }
-        );
-        toast(`恢复完成：${statusMeta(updated.status).label}`, outcomeKind(updated.status));
-        await refresh({ force: true });
-      } catch (error) {
-        toast(error.message, "error");
-        recover.disabled = false;
-        recover.textContent = "恢复执行";
-      } finally {
-        state.mutating -= 1;
-        busy = false;
-      }
-    });
+    if (issue.task_id) {
+      const recover = h("button", "btn btn-primary btn-small", "恢复执行");
+      recover.type = "button";
+      recover.disabled = !recoverable;
+      if (!recoverable) recover.title = "该状态需要人工核查，不能自动继续";
+      actions.append(recover);
+
+      let busy = false;
+      recover.addEventListener("click", async () => {
+        if (busy || !recoverable) return;
+        busy = true;
+        recover.disabled = true;
+        recover.textContent = "恢复中…";
+        state.mutating += 1;
+        try {
+          const updated = await api(
+            `/tasks/${encodeURIComponent(issue.task_id)}/recover`,
+            { method: "POST", body: "{}" }
+          );
+          toast(
+            `恢复完成：${statusMeta(updated.status).label}`,
+            outcomeKind(updated.status)
+          );
+          await refresh({ force: true });
+        } catch (error) {
+          toast(error.message, "error");
+          recover.disabled = false;
+          recover.textContent = "恢复执行";
+        } finally {
+          state.mutating -= 1;
+          busy = false;
+        }
+      });
+    }
+
+    if (issue.kind === "staging_orphaned" && issue.approval_id) {
+      const abandon = h("button", "btn btn-danger-outline btn-small", "撤回遗留提案");
+      abandon.type = "button";
+      abandon.title = "先只读对账；若商城已提交，接口会拒绝撤回";
+      actions.append(abandon);
+
+      let busy = false;
+      abandon.addEventListener("click", async () => {
+        if (busy) return;
+        busy = true;
+        abandon.disabled = true;
+        abandon.textContent = "撤回中…";
+        state.mutating += 1;
+        try {
+          await api(
+            `/approvals/${encodeURIComponent(issue.approval_id)}/abandon`,
+            {
+              method: "POST",
+              body: JSON.stringify({ reason: "审批台清理遗留提案" }),
+            }
+          );
+          toast("遗留提案已撤回，staging 已丢弃", "success");
+          await refresh({ force: true });
+        } catch (error) {
+          toast(error.message, "error");
+          abandon.disabled = false;
+          abandon.textContent = "撤回遗留提案";
+        } finally {
+          state.mutating -= 1;
+          busy = false;
+        }
+      });
+    }
+
+    if (actions.childElementCount) card.append(actions);
 
     return card;
   }

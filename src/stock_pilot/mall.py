@@ -72,6 +72,25 @@ def get_listing(db_path: str, request: GetListingInput) -> GetListingOutput:
     )
 
 
+def get_listing_by_id(
+    db_path: str, listing_id: str
+) -> ListingCandidate | None:
+    """Admin-plane lookup by listing id (used by orphan-proposal cleanup)."""
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id, sku_id, title, spec, price_cents, status,"
+            " inventory_record_id FROM listings WHERE id = ?",
+            (listing_id,),
+        ).fetchone()
+        pending = (
+            _pending_for_listing(conn, listing_id) if row is not None else None
+        )
+    finally:
+        conn.close()
+    return _candidate(row, pending) if row is not None else None
+
+
 def _pending_for_listing(
     conn: sqlite3.Connection, listing_id: str
 ) -> PendingState | None:
@@ -212,6 +231,11 @@ def publish_listing(
                 ErrorCode.APPROVAL_ALREADY_CONSUMED,
                 f"approval {request.approval_id!r} was already consumed",
             )
+        if approval_status is ApprovalStatus.ABANDONED:
+            raise ToolFailure(
+                ErrorCode.APPROVAL_NOT_APPROVED,
+                f"approval {request.approval_id!r} was abandoned by the system",
+            )
 
         staging = tx.execute(
             "SELECT id, new_price_cents, original_price_cents, status"
@@ -225,7 +249,7 @@ def publish_listing(
             )
 
         listing = tx.execute(
-            "SELECT id, price_cents FROM listings WHERE id = ?",
+            "SELECT id, price_cents, inventory_record_id FROM listings WHERE id = ?",
             (request.listing_id,),
         ).fetchone()
         if listing is None:
@@ -237,6 +261,24 @@ def publish_listing(
             raise ToolFailure(
                 ErrorCode.LISTING_PRICE_CHANGED,
                 "listing price changed after the proposal was staged; refusing to overwrite",
+            )
+
+        # Last line of defence against the recheck/commit race: inventory can
+        # still change between the agent's read-only recheck and this commit.
+        # In the split production topology this becomes a stock reservation.
+        inventory = tx.execute(
+            "SELECT quantity FROM inventory_records WHERE id = ?",
+            (listing["inventory_record_id"],),
+        ).fetchone()
+        if inventory is None:
+            raise ToolFailure(
+                ErrorCode.INVENTORY_NOT_FOUND,
+                "inventory record disappeared before commit",
+            )
+        if inventory["quantity"] <= 0:
+            raise ToolFailure(
+                ErrorCode.INSUFFICIENT_STOCK,
+                "inventory is depleted at commit time",
             )
 
         tx.execute(

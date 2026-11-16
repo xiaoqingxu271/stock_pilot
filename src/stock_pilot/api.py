@@ -21,28 +21,35 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from stock_pilot import approval, audit, recovery, tasks
+from stock_pilot import approval, audit, mall, recovery, tasks
 from stock_pilot.agent import (
     build_graph,
     confirm_mapping_and_resume,
     decide_and_resume,
     resume_task,
     start_task,
+    verify_published_task,
 )
 from stock_pilot.clients import ToolClient, create_tool_client
 from stock_pilot.config import Settings
+from stock_pilot.db import utcnow
 from stock_pilot.enums import (
     ApprovalStatus,
     ErrorCode,
+    ListingResult,
+    ListingStatus,
     StagingStatus,
     TaskStatus,
 )
 from stock_pilot.errors import ToolFailure
 from stock_pilot.models import (
+    AbandonApprovalRequest,
     ApprovalDecisionRequest,
     ApprovalQueueItem,
     ApprovalView,
     CreateTaskRequest,
+    GetListingInput,
+    HealthStatus,
     MappingConfirmRequest,
     RecoveryIssue,
     TaskView,
@@ -191,11 +198,52 @@ def create_app(
     def list_recovery_issues() -> list[RecoveryIssue]:
         return recovery.scan(db_path)
 
+    @app.get("/healthz", response_model=HealthStatus)
+    def health(response: Response) -> HealthStatus:
+        db_ok = True
+        try:
+            conn = sqlite3.connect(db_path, timeout=1.0)
+            try:
+                conn.execute("SELECT 1 FROM tasks LIMIT 1").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            db_ok = False
+
+        probe = getattr(client, "is_available", None)
+        try:
+            tool_ok = bool(probe()) if callable(probe) else True
+        except Exception:  # noqa: BLE001 - a failing probe means unavailable
+            tool_ok = False
+
+        pending = 0
+        issues = 0
+        if db_ok:
+            try:
+                pending = len(approval.list_approvals(db_path, ApprovalStatus.PENDING))
+                issues = len(recovery.scan(db_path))
+            except sqlite3.Error:
+                db_ok = False
+
+        healthy = db_ok and tool_ok
+        if not healthy:
+            response.status_code = 503
+        return HealthStatus(
+            status="ok" if healthy else "degraded",
+            database=db_ok,
+            tool_client=tool_ok,
+            pending_approvals=pending,
+            recovery_issues=issues,
+            checked_at=utcnow(),
+        )
+
     @app.post("/tasks/{task_id}/recover", response_model=TaskView)
     def recover_task(task_id: str) -> TaskView:
         task = tasks.get_task(db_path, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
+        if task.status is TaskStatus.PUBLISHED:
+            return verify_published_task(client, task_id)
         if task.status is not TaskStatus.AWAITING_APPROVAL:
             raise _http_error(
                 ToolFailure(
@@ -249,6 +297,79 @@ def create_app(
                 request.note,
                 request.decided_by,
             )
+        except ToolFailure as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/approvals/{approval_id}/abandon", response_model=ApprovalView)
+    def abandon_approval_record(
+        approval_id: str, request: AbandonApprovalRequest
+    ) -> ApprovalView:
+        current = approval.get_approval(db_path, approval_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="approval not found")
+        if current.status is ApprovalStatus.ABANDONED:
+            return client.abandon_approval(approval_id, request.reason)
+        if current.status is not ApprovalStatus.APPROVED:
+            raise _http_error(
+                ToolFailure(
+                    ErrorCode.INVALID_STATE,
+                    f"approval is {current.status.value}; only approved proposals"
+                    " can be withdrawn",
+                )
+            )
+
+        listing = mall.get_listing_by_id(db_path, current.listing_id)
+        if listing is None:
+            raise _http_error(
+                ToolFailure(
+                    ErrorCode.LISTING_NOT_FOUND,
+                    f"listing {current.listing_id!r} does not exist",
+                )
+            )
+
+        # Reconciliation is mandatory: never discard staging when the mall
+        # may already have committed the proposal.
+        observed = client.get_listing(GetListingInput(sku_id=listing.sku_id))
+        if not observed.ok:
+            raise _http_error(
+                ToolFailure(
+                    ErrorCode.INVALID_STATE,
+                    "cannot reconcile with the mall; refusing to withdraw",
+                )
+            )
+        if observed.result is ListingResult.RESOLVED:
+            candidate = observed.listing
+        elif observed.result is ListingResult.AMBIGUOUS:
+            candidate = next(
+                (
+                    item
+                    for item in observed.candidates
+                    if item.listing_id == current.listing_id
+                ),
+                None,
+            )
+        else:
+            candidate = None
+        if candidate is None:
+            raise _http_error(
+                ToolFailure(
+                    ErrorCode.LISTING_NOT_FOUND,
+                    f"listing {current.listing_id!r} was not found during reconciliation",
+                )
+            )
+        if (
+            candidate.price == current.new_price
+            and candidate.status is ListingStatus.PUBLISHED
+        ):
+            raise _http_error(
+                ToolFailure(
+                    ErrorCode.INVALID_STATE,
+                    "the mall already committed this proposal; refusing to withdraw",
+                )
+            )
+
+        try:
+            return client.abandon_approval(approval_id, request.reason)
         except ToolFailure as exc:
             raise _http_error(exc) from exc
 

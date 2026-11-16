@@ -53,6 +53,9 @@ def test_ui_static_assets_are_served(client):
     assert "refresh" in js.text
     assert "/recovery" in js.text
     assert "decided_by" in js.text
+    assert "/abandon" in js.text
+    assert "staging_orphaned" in js.text
+    assert "published_verify_pending" in js.text
 
 
 def test_approval_queue_is_enriched_for_the_ui(client):

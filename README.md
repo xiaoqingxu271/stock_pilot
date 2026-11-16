@@ -15,6 +15,7 @@ check_inventory → get_listing → update_price（审批）
 |---|---|
 | 库存 ≤ 0 | 在 `check_stock` 终止，审批、staging、商城写入均为零 |
 | 审批期间库存归零 | 审批通过后、提交前再查一次库存；不足则系统撤回提案（`abandoned`），丢弃 staging，任务回滚 |
+| 复核与提交之间库存变化 | `publish_listing` 在提交事务内重新校验库存；不足则整个事务回滚，商城零写入 |
 | 商品映射歧义 | `get_listing` 返回候选列表，LangGraph `interrupt` 挂起，必须人工选定，禁止猜测 |
 | 写操作必须审批 | `update_price` 只写 staging + 审批记录；商城公开价格在审批通过前不变 |
 | 审批拒绝零残留 | 拒绝时丢弃 staging；商城侧从未发生写入 |
@@ -65,7 +66,9 @@ check_inventory → get_listing → update_price（审批）
 
 **发布前复核**：审批可能持续数小时，库存不是审批时的快照。图在 `await_approval` 与 `publish` 之间增加 `recheck_stock`：库存不足、记录消失或复核工具失败时，系统不提交，而是把审批标记为 `abandoned` 并在同一事务里丢弃 staging；任务进入 `ROLLED_BACK`（库存不足）或 `ABORTED_UNKNOWN_STATE`（无法确认）。`abandoned` 不是人工拒绝，审计上区分开。
 
-**重启恢复**：`GET /recovery` 只读扫描中断态任务（已审批未提交、已拒绝/系统撤回未关闭、已提交未核对），以及写超时后遗留的 `price_staged` 提案。可自动继续的任务由 `POST /tasks/{id}/recover` 从图 checkpoint 恢复；遗留提案只标注、不自动写，避免在状态未知时做第二次决定。
+**重启恢复**：`GET /recovery` 只读扫描中断态任务（已审批未提交、已拒绝/系统撤回未关闭、已提交未核对），以及写超时后遗留的 `price_staged` 提案。可自动继续的任务由 `POST /tasks/{id}/recover` 从图 checkpoint 恢复：已审批的任务继续走发布链路，已提交的任务只补做最终只读核对（绝不重复发布）。遗留提案只标注、不自动写；人工确认后可用 `POST /approvals/{id}/abandon` 撤回，该接口会先做一次只读对账，商城已提交则拒绝撤回。
+
+**健康检查**：`GET /healthz` 返回数据库连通性、工具客户端可用性、待审批数与恢复问题数；数据库或工具客户端不可用时返回 `503` 与 `status=degraded`，部署层据此摘流量，避免在工具不可用时接收新的写任务。
 
 ## 快速开始
 
@@ -95,8 +98,9 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 3. **映射歧义**：提交 `SKU-AMBIG-002` / `白色-M` → 任务挂起，显示两个候选 → 人工选 `LST-002` → 进入审批 → 通过 → 核对。
 4. **审批拒绝**：任意正常提案 → 拒绝并填写原因 → 任务 `rolled_back`，staging 丢弃，商城价格不变。
 5. **审批期间库存归零**：提交提案后把 `inventory_records.quantity` 改为 0，再审批通过 → 任务 `rolled_back` / `INSUFFICIENT_STOCK`，审批 `abandoned`，staging 丢弃，商城不变。
-6. **重启恢复**：提交提案后重启 API → 原任务仍在队列，审批后正常完成。模拟「已决策未恢复」后，页面出现「待恢复任务」面板，点击「恢复执行」完成后续步骤。
+6. **重启恢复**：提交提案后重启 API → 原任务仍在队列，审批后正常完成。模拟「已决策未恢复」后，页面出现「待恢复任务」面板，点击「恢复执行」完成后续步骤；模拟「已提交未核对」则只补做只读核对。
 7. **重复提交**：带相同 `Idempotency-Key` 连续提交两次，只产生一个任务和一条审批。
+8. **遗留提案清理**：写超时遗留的 `staging_orphaned` 在恢复面板显示「撤回遗留提案」；接口先只读对账，商城已按提案提交时返回 `409`，不会误删。
 
 ## API
 
@@ -109,10 +113,12 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 | `POST` | `/tasks/{id}/mapping` | 确认歧义商品的候选 listing |
 | `POST` | `/tasks/{id}/recover` | 恢复「已决策但未继续」的任务 |
 | `POST` | `/approvals/{id}/decision` | 审批：`approve` / `reject`，可带 `note` 与 `decided_by` |
+| `POST` | `/approvals/{id}/abandon` | 人工撤回遗留提案；先只读对账，商城已提交则拒绝 |
 | `GET` | `/approvals` | 审批记录，可按状态过滤 |
 | `GET` | `/approvals/queue` | 审批台联表队列（商品 + 任务上下文） |
 | `GET` | `/approvals/{id}` | 单条审批详情 |
 | `GET` | `/recovery` | 只读重启对账结果 |
+| `GET` | `/healthz` | 就绪检查；不可用时 `503` + `status=degraded` |
 
 审批决策是幂等的：重复提交相同决策返回当前任务；提交相反决策返回 `409`。
 
@@ -122,6 +128,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 |---|---|---|
 | `INSUFFICIENT_STOCK`（任务开始时） | `ABORTED_NO_STOCK` | 禁止 |
 | `INSUFFICIENT_STOCK`（发布前复核） | `ROLLED_BACK` | 禁止，审批 `abandoned`，staging 已丢弃 |
+| `INSUFFICIENT_STOCK`（提交事务内复查） | `ROLLED_BACK` | 事务回滚，商城零写入，审批 `abandoned` |
 | `MAPPING_AMBIGUOUS` | `SUSPENDED_AMBIGUOUS` | 等待人工映射 |
 | `APPROVAL_REJECTED` | `ROLLED_BACK` | 禁止，staging 已丢弃 |
 | `TOOL_TIMEOUT` / `TOOL_UNAVAILABLE` / `CIRCUIT_OPEN`（写） | 一次只读对账；失败则 `ABORTED_UNKNOWN_STATE` | 禁止重发 |
@@ -131,7 +138,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 59 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 67 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -139,10 +146,10 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_tools_acceptance.py`：四条验收用例的工具层断言 + MCP 工具注册。
 - `tests/test_agent_acceptance.py`：图编排、映射恢复、写超时对账、拒绝/超时后零后续写。
 - `tests/test_runner.py`：超时重试、熔断、写不重试、业务失败不计入熔断。
-- `tests/test_api.py`：FastAPI 操作接口与错误码。
-- `tests/test_ui.py`：审批台静态资源、队列联表、恢复入口。
+- `tests/test_api.py`：FastAPI 操作接口、错误码与就绪检查。
+- `tests/test_ui.py`：审批台静态资源、队列联表、恢复入口与遗留提案清理。
 - `tests/test_mcp_client.py`：真实 MCP stdio 全链路、API/MCP 模式、服务不可用或中途退出时安全终止。
-- `tests/test_recovery.py`：进程重启、幂等提交、审批幂等、操作者身份、工具时间线、恢复接口、发布前库存复核与系统撤回。
+- `tests/test_recovery.py`：进程重启、幂等提交、审批幂等、操作者身份、工具时间线、恢复接口（含已提交任务只读核对）、发布前与事务内库存复核、遗留提案撤回。
 
 ## 目录
 

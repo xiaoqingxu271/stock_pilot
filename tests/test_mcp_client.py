@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 import sys
 from decimal import Decimal
@@ -36,7 +37,10 @@ from stock_pilot.models import (
 
 @pytest.fixture
 def mcp_client(settings: Settings):
-    client = MCPToolClient(settings, connect_timeout=30.0)
+    # Allow generous per-call time for a cold Python/MCP subprocess; these
+    # tests exercise the protocol, not the timeout policy (see test_runner).
+    mcp_settings = dataclasses.replace(settings, tool_timeout_seconds=15.0)
+    client = MCPToolClient(mcp_settings, connect_timeout=30.0)
     try:
         yield client
     finally:

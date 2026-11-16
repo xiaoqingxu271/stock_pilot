@@ -81,6 +81,26 @@ def _is_terminal(state: AgentState) -> bool:
         return False
 
 
+def _build_verification(
+    listing_id: str, expected_price: Decimal, listing
+) -> VerificationResult:
+    matched = (
+        listing is not None
+        and listing.listing_id == listing_id
+        and listing.price == expected_price
+        and listing.status is ListingStatus.PUBLISHED
+    )
+    return VerificationResult(
+        listing_id=listing_id,
+        expected_price=expected_price,
+        actual_price=listing.price if listing is not None else None,
+        expected_status=ListingStatus.PUBLISHED,
+        actual_status=listing.status if listing is not None else None,
+        matched=matched,
+        checked_at=utcnow(),
+    )
+
+
 def _select_listing(result, listing_id: str | None):
     """Pick the known listing from a resolved/ambiguous read. Never guesses."""
     if not result.ok or listing_id is None:
@@ -446,6 +466,26 @@ def build_graph(
             return {"status": TaskStatus.PUBLISHED.value}
 
         if result.error_code in (
+            ErrorCode.INSUFFICIENT_STOCK,
+            ErrorCode.INVENTORY_NOT_FOUND,
+        ):
+            # The in-transaction stock gate refused the commit. Nothing was
+            # written to the mall; withdraw the approved staging row.
+            failure = _abandon_proposal(
+                state,
+                f"提交事务内库存校验失败：{result.error_code.value}，系统撤回提案",
+            )
+            if failure is not None:
+                return failure
+            if result.error_code is ErrorCode.INSUFFICIENT_STOCK:
+                return finish(
+                    state, TaskStatus.ROLLED_BACK, ErrorCode.INSUFFICIENT_STOCK
+                )
+            return finish(
+                state, TaskStatus.ABORTED_NOT_FOUND, ErrorCode.INVENTORY_NOT_FOUND
+            )
+
+        if result.error_code in (
             ErrorCode.TOOL_TIMEOUT,
             ErrorCode.TOOL_UNAVAILABLE,
             ErrorCode.CIRCUIT_OPEN,
@@ -502,14 +542,8 @@ def build_graph(
 
         listing = _select_listing(result, state.get("listing_id"))
         if listing is None:
-            verification = VerificationResult(
-                listing_id=state.get("listing_id") or "",
-                expected_price=_target(state),
-                actual_price=None,
-                expected_status=ListingStatus.PUBLISHED,
-                actual_status=None,
-                matched=False,
-                checked_at=utcnow(),
+            verification = _build_verification(
+                state.get("listing_id") or "", _target(state), None
             )
             return finish(
                 state,
@@ -520,20 +554,10 @@ def build_graph(
                 ),
             )
 
-        matched = (
-            listing.listing_id == state.get("listing_id")
-            and listing.price == _target(state)
-            and listing.status is ListingStatus.PUBLISHED
+        verification = _build_verification(
+            listing.listing_id, _target(state), listing
         )
-        verification = VerificationResult(
-            listing_id=listing.listing_id,
-            expected_price=_target(state),
-            actual_price=listing.price,
-            expected_status=ListingStatus.PUBLISHED,
-            actual_status=listing.status,
-            matched=matched,
-            checked_at=utcnow(),
-        )
+        matched = verification.matched
         task_verification = TaskVerification(
             result=verification, verified_at=utcnow()
         )
@@ -634,6 +658,57 @@ def resume_task(client: ToolClient, graph, task_id: str, value: Any) -> TaskView
     refreshed = tasks.get_task(client.settings.db_path, task_id)
     assert refreshed is not None
     return refreshed
+
+
+def verify_published_task(client: ToolClient, task_id: str) -> TaskView:
+    """Finish a recovered task whose mall commit already happened.
+
+    This is intentionally read-only on the mall side: it re-reads the listing,
+    records the same verification structure as the graph's ``verify`` node, and
+    never calls ``publish_listing`` again.
+    """
+    db_path = client.settings.db_path
+    task = tasks.get_task(db_path, task_id)
+    if task is None:
+        raise ToolFailure(ErrorCode.MAPPING_NOT_FOUND, f"task {task_id!r} not found")
+    if task.status is not TaskStatus.PUBLISHED:
+        raise ToolFailure(
+            ErrorCode.INVALID_STATE,
+            f"task is {task.status.value}, not awaiting verification",
+        )
+
+    with audit.task_context(task_id):
+        result = client.get_listing(GetListingInput(sku_id=task.sku_id))
+    if not result.ok:
+        return tasks.update_task(
+            db_path,
+            task_id,
+            status=TaskStatus.FAILED_VERIFICATION,
+            error_code=result.error_code or ErrorCode.INTERNAL_ERROR,
+        )
+
+    listing = _select_listing(result, task.listing_id)
+    verification = _build_verification(
+        task.listing_id or "", task.target_price, listing
+    )
+    task_verification = TaskVerification(
+        result=verification, verified_at=utcnow()
+    )
+    status = (
+        TaskStatus.VERIFIED if verification.matched else TaskStatus.FAILED_VERIFICATION
+    )
+    return tasks.update_task(
+        db_path,
+        task_id,
+        status=status,
+        final_price=listing.price if listing is not None else None,
+        verification=task_verification,
+        error_code=(
+            None
+            if listing is not None
+            else ErrorCode.MAPPING_NOT_FOUND
+        ),
+    )
 
 
 def _approval_matches_decision(approval, decision: ApprovalDecision) -> bool:
