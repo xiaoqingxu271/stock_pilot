@@ -36,7 +36,7 @@ class Settings:
     # After this many failed sends an event is dead-lettered instead of being
     # retried forever; delivered/dead rows are pruned after the retention
     # window. Neither setting can trigger a tool write.
-    outbox_max_attempts: int = 5
+    outbox_max_attempts: int = 60
     outbox_retention_seconds: int = 7 * 24 * 60 * 60
     # Opt-in background sweep for leaked stock reservations. Zero disables it
     # (the default for demos); the sweep rule stays as conservative as the
@@ -121,7 +121,7 @@ class Settings:
                 os.environ.get("STOCK_PILOT_OUTBOX_INTERVAL", "2")
             ),
             outbox_max_attempts=int(
-                os.environ.get("STOCK_PILOT_OUTBOX_MAX_ATTEMPTS", "5")
+                os.environ.get("STOCK_PILOT_OUTBOX_MAX_ATTEMPTS", "60")
             ),
             outbox_retention_seconds=int(
                 os.environ.get("STOCK_PILOT_OUTBOX_RETENTION", "604800")

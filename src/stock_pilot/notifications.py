@@ -32,7 +32,7 @@ from stock_pilot.enums import (
 logger = logging.getLogger(__name__)
 
 _MAX_ERROR_LENGTH = 500
-DEFAULT_MAX_ATTEMPTS = 5
+DEFAULT_MAX_ATTEMPTS = 60
 DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 

@@ -33,7 +33,7 @@ MCP 模式下，工具服务端也会把尝试写入共享演示库；服务端�
 默认 0 关闭），三者执行同一条保守规则。
 
 `stock_pilot_outbox_pending` 长期大于 0 说明通知发送器持续失败或 worker 未运行。
-连续失败达到 `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS`（默认 5）后事件转入死信，
+连续失败达到 `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS`（默认 60，默认轮询下约 2 分钟）后事件转入死信，
 `stock_pilot_outbox_dead` 增加，不再无限重试；已投递与死信行超过
 `STOCK_PILOT_OUTBOX_RETENTION`（默认 7 天）后被清理。投递是至少一次语义，
 崩溃可能在发送后、标记前重放一条通知；消费方按 `dedupe_key` 去重。worker 不

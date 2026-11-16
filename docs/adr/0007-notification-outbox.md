@@ -41,9 +41,10 @@ tests inject a recording or failing sender. The worker calls
   (at-least-once; consumers dedupe by `dedupe_key`);
 - sender failure → row stays pending, `attempts` increments, `last_error` is
   recorded, the next pass retries;
-- after `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS` failures (default 5) the row is
-  dead-lettered via `dead_lettered_at` and excluded from later passes. It is
-  visible to `stock_pilot_outbox_dead` and stays in the table for inspection;
+- after `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS` failures (default 60, about two
+  minutes at the default poll interval) the row is dead-lettered via
+  `dead_lettered_at` and excluded from later passes. It is visible to
+  `stock_pilot_outbox_dead` and stays in the table for inspection;
 - the worker never imports or receives `ToolClient`, so it cannot call
   `publish_listing`, `update_price`, or any other MCP tool.
 
