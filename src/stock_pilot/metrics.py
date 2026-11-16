@@ -18,6 +18,7 @@ from prometheus_client.core import (
 
 from stock_pilot import recovery
 from stock_pilot.db import connect
+from stock_pilot.enums import RecoveryKind
 
 LATENCY_BUCKETS_MS = (10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000)
 
@@ -30,9 +31,13 @@ class StockPilotCollector:
         tool_client_available: bool,
         *,
         mall_db_path: str | None = None,
+        inventory_db_path: str | None = None,
+        reservation_ttl_seconds: int = 900,
     ) -> None:
         self.db_path = db_path
         self.mall_db_path = mall_db_path or db_path
+        self.inventory_db_path = inventory_db_path or db_path
+        self.reservation_ttl_seconds = reservation_ttl_seconds
         self.circuit_states = circuit_states
         self.tool_client_available = tool_client_available
 
@@ -66,6 +71,25 @@ class StockPilotCollector:
         finally:
             mall_conn.close()
 
+        inventory_conn = connect(self.inventory_db_path)
+        try:
+            reservations_open = inventory_conn.execute(
+                "SELECT COUNT(*) AS n FROM inventory_records"
+                " WHERE reserved_by IS NOT NULL"
+            ).fetchone()["n"]
+        finally:
+            inventory_conn.close()
+
+        issues = recovery.scan(
+            self.db_path,
+            mall_db_path=self.mall_db_path,
+            inventory_db_path=self.inventory_db_path,
+            reservation_ttl_seconds=self.reservation_ttl_seconds,
+        )
+        reservations_stale = sum(
+            issue.kind is RecoveryKind.RESERVATION_STALE for issue in issues
+        )
+
         yield self._tasks(task_rows)
         yield self._events(event_rows)
         yield self._latency(latency_rows)
@@ -76,12 +100,18 @@ class StockPilotCollector:
         )
         yield self._gauge(
             "stock_pilot_recovery_issues",
-            "Non-terminal tasks or orphaned staging rows needing attention.",
-            len(
-                recovery.scan(
-                    self.db_path, mall_db_path=self.mall_db_path
-                )
-            ),
+            "Non-terminal tasks, orphaned staging rows, or leaked reservations.",
+            len(issues),
+        )
+        yield self._gauge(
+            "stock_pilot_reservations_open",
+            "Inventory records currently held by a publish reservation.",
+            reservations_open,
+        )
+        yield self._gauge(
+            "stock_pilot_reservations_stale",
+            "Active reservations beyond the advisory TTL.",
+            reservations_stale,
         )
         yield self._circuits()
         yield self._gauge(
@@ -153,6 +183,8 @@ def render_metrics(
     db_path: str,
     *,
     mall_db_path: str | None = None,
+    inventory_db_path: str | None = None,
+    reservation_ttl_seconds: int = 900,
     circuit_states: dict[str, bool] | None = None,
     tool_client_available: bool = True,
 ) -> bytes:
@@ -164,6 +196,8 @@ def render_metrics(
             lambda: states,
             tool_client_available,
             mall_db_path=mall_db_path,
+            inventory_db_path=inventory_db_path,
+            reservation_ttl_seconds=reservation_ttl_seconds,
         )
     )
     return generate_latest(registry)

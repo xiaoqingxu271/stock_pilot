@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from stock_pilot import approval, audit, auth, mall, recovery, tasks
+from stock_pilot import approval, audit, auth, mall, recovery, reservations, tasks
 from stock_pilot.agent import (
     build_graph,
     confirm_mapping_and_resume,
@@ -52,8 +52,10 @@ from stock_pilot.models import (
     CreateTaskRequest,
     GetListingInput,
     HealthStatus,
+    ListReservationsOutput,
     MappingConfirmRequest,
     RecoveryIssue,
+    ReservationGcResponse,
     TaskView,
     ToolEvent,
 )
@@ -69,6 +71,11 @@ _CONFLICT = {
     ErrorCode.INVALID_STATE,
     ErrorCode.PENDING_APPROVAL_EXISTS,
     ErrorCode.IDEMPOTENCY_CONFLICT,
+}
+_UPSTREAM = {
+    ErrorCode.TOOL_TIMEOUT,
+    ErrorCode.TOOL_UNAVAILABLE,
+    ErrorCode.CIRCUIT_OPEN,
 }
 
 
@@ -99,9 +106,17 @@ def create_app(
     approval_db = settings.approval_db
     mall_db = settings.store_mall
 
+    def scan_recovery():
+        return recovery.scan(
+            db_path,
+            mall_db_path=mall_db,
+            inventory_db_path=settings.store_inventory,
+            reservation_ttl_seconds=settings.reservation_ttl_seconds,
+        )
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        issues = recovery.scan(db_path, mall_db_path=mall_db)
+        issues = scan_recovery()
         if issues:
             logger.warning(
                 "recovery scan found %d task(s) needing attention: %s",
@@ -250,7 +265,43 @@ def create_app(
     def list_recovery_issues(
         _principal: Principal | None = Depends(_require(None)),
     ) -> list[RecoveryIssue]:
-        return recovery.scan(db_path, mall_db_path=mall_db)
+        return scan_recovery()
+
+    @app.get("/reservations", response_model=ListReservationsOutput)
+    def list_stock_reservations(
+        _principal: Principal | None = Depends(_require(None)),
+    ) -> ListReservationsOutput:
+        if not settings.split_stores:
+            # Reservations are a split-store saga step; shared mode has none.
+            return ListReservationsOutput(checked_at=utcnow())
+        result = client.list_reservations()
+        if not result.ok:
+            raise HTTPException(
+                status_code=503,
+                detail=result.message or "cannot read stock reservations",
+            )
+        return result
+
+    @app.post("/reservations/gc", response_model=ReservationGcResponse)
+    def sweep_stock_reservations(
+        _principal: Principal | None = Depends(_require(Role.OPERATOR)),
+    ) -> ReservationGcResponse:
+        """Release only reservations whose approval can no longer publish."""
+        if not settings.split_stores:
+            return ReservationGcResponse(
+                checked_at=utcnow(), released=0, retained=0, stale=0, failed=0
+            )
+        try:
+            return reservations.sweep(
+                client, ttl_seconds=settings.reservation_ttl_seconds
+            )
+        except ToolFailure as exc:
+            if exc.code in _UPSTREAM:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"reservation sweep unavailable: {exc.message}",
+                ) from exc
+            raise _http_error(exc) from exc
 
     @app.get("/healthz", response_model=HealthStatus)
     def health(response: Response) -> HealthStatus:
@@ -281,7 +332,7 @@ def create_app(
                 pending = len(
                     approval.list_approvals(approval_db, ApprovalStatus.PENDING)
                 )
-                issues = len(recovery.scan(db_path, mall_db_path=mall_db))
+                issues = len(scan_recovery())
             except sqlite3.Error:
                 db_ok = False
 
@@ -310,6 +361,8 @@ def create_app(
             content=render_metrics(
                 db_path,
                 mall_db_path=mall_db,
+                inventory_db_path=settings.store_inventory,
+                reservation_ttl_seconds=settings.reservation_ttl_seconds,
                 circuit_states=circuit_states,
                 tool_client_available=available,
             ),

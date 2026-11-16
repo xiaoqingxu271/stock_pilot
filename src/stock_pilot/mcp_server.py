@@ -24,6 +24,7 @@ from stock_pilot.models import (
     CheckInventoryOutput,
     GetListingInput,
     GetListingOutput,
+    ListReservationsOutput,
     PublishListingInput,
     PublishListingOutput,
     ReleaseInventoryInput,
@@ -61,10 +62,11 @@ def register_inventory_tools(server: MCPServer, tools: StockPilotTools) -> None:
 def register_inventory_saga_tools(
     server: MCPServer, tools: StockPilotTools
 ) -> None:
-    """Internal reserve/release steps used only by the split deployment.
+    """Internal reserve/release/list steps used only by the split deployment.
 
     These are not part of the four model-facing tools; they close the
-    recheck-to-commit race without giving the model a write primitive.
+    recheck-to-commit race without giving the model a write primitive, and
+    let the orchestrator sweep reservations left by a crash.
     """
 
     @server.tool(
@@ -93,6 +95,17 @@ def register_inventory_saga_tools(
     async def release_inventory(approval_id: str) -> ReleaseInventoryOutput:
         request = ReleaseInventoryInput(approval_id=approval_id)
         return await asyncio.to_thread(tools.release_inventory, request)
+
+    @server.tool(
+        name="list_reservations",
+        description=(
+            "Internal saga read. List live stock reservations with their age "
+            "and advisory expiry; never releases anything."
+        ),
+        structured_output=True,
+    )
+    async def list_reservations() -> ListReservationsOutput:
+        return await asyncio.to_thread(tools.list_reservations)
 
 
 def register_mall_tools(server: MCPServer, tools: StockPilotTools) -> None:

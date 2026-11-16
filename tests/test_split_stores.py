@@ -354,6 +354,10 @@ def test_split_http_servers_route_the_reservation_saga(tmp_path):
         )
         assert reserved.ok and reserved.reserved
 
+        listed = client.list_reservations()
+        assert listed.ok
+        assert [item.approval_id for item in listed.reservations] == ["apr-split"]
+
         released = client.release_inventory(
             ReleaseInventoryInput(approval_id="apr-split")
         )

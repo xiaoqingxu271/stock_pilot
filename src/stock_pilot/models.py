@@ -17,6 +17,7 @@ from stock_pilot.enums import (
     ListingStatus,
     PendingStage,
     RecoveryKind,
+    ReservationGcAction,
     StagingStatus,
     TaskStatus,
     ToolOutcome,
@@ -88,6 +89,10 @@ class ReserveInventoryInput(StrictModel):
 
 class ReleaseInventoryInput(StrictModel):
     approval_id: ShortText
+
+
+class ListReservationsInput(StrictModel):
+    """Internal saga read; the inventory server reports its own TTL view."""
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +228,33 @@ class ReserveInventoryOutput(ToolOutput):
     approval_id: str | None = None
     quantity: int | None = None
     reserved: bool = False
+    reserved_at: datetime | None = None
+    # TTL is advisory: the sweep never releases a reservation whose approval
+    # can still publish, so an expired timestamp is a report, not permission.
+    expires_at: datetime | None = None
 
 
 class ReleaseInventoryOutput(ToolOutput):
     approval_id: str | None = None
     released: bool = False
+
+
+class ReservationView(BaseModel):
+    """One live reservation, enriched with its age for operator review."""
+
+    inventory_record_id: str
+    sku_id: str
+    spec: str
+    quantity: int
+    approval_id: str
+    reserved_at: datetime
+    age_seconds: int
+    expires_at: datetime
+
+
+class ListReservationsOutput(ToolOutput):
+    reservations: list[ReservationView] = Field(default_factory=list)
+    checked_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +281,27 @@ class MappingConfirmRequest(StrictModel):
 
 class AbandonApprovalRequest(StrictModel):
     reason: str = Field(default="人工清理遗留提案", min_length=1, max_length=500)
+
+
+class ReservationGcItem(BaseModel):
+    inventory_record_id: str
+    approval_id: str
+    sku_id: str | None = None
+    spec: str | None = None
+    approval_status: ApprovalStatus | None = None
+    task_status: TaskStatus | None = None
+    age_seconds: int
+    action: ReservationGcAction
+    reason: str
+
+
+class ReservationGcResponse(BaseModel):
+    checked_at: datetime
+    released: int
+    retained: int
+    stale: int
+    failed: int
+    items: list[ReservationGcItem] = Field(default_factory=list)
 
 
 class TaskVerification(BaseModel):
@@ -321,3 +369,5 @@ class RecoveryIssue(BaseModel):
     approval_id: str | None = None
     approval_status: ApprovalStatus | None = None
     staging_status: StagingStatus | None = None
+    inventory_record_id: str | None = None
+    reserved_at: datetime | None = None

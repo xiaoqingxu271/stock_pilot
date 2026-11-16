@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
+import time
 import urllib.error
 import urllib.request
 from decimal import Decimal
@@ -151,11 +152,19 @@ def test_http_servers_reject_missing_or_wrong_bearer(http_servers):
             headers={"Content-Type": "application/json", **headers},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as response:
-                return response.status
-        except urllib.error.HTTPError as exc:
-            return exc.code
+        # Windows occasionally aborts the first connection to a fresh uvicorn
+        # listener before the response line arrives; retry briefly.
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    return response.status
+            except urllib.error.HTTPError as exc:
+                return exc.code
+            except (ConnectionAbortedError, ConnectionResetError):
+                if attempt == 2:
+                    raise
+                time.sleep(0.2)
+        raise AssertionError("unreachable")
 
     assert status({}) == 401
     assert status({"Authorization": "Bearer wrong-token"}) == 401

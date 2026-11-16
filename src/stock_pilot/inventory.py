@@ -8,14 +8,18 @@ publish-time recheck and the mall commit. They are not offered to the model.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from stock_pilot.db import connect, iso, parse_dt, transaction, utcnow
 from stock_pilot.enums import ErrorCode
 from stock_pilot.errors import ToolFailure
 from stock_pilot.models import (
     CheckInventoryInput,
     CheckInventoryOutput,
+    ListReservationsOutput,
     ReleaseInventoryInput,
     ReleaseInventoryOutput,
+    ReservationView,
     ReserveInventoryInput,
     ReserveInventoryOutput,
 )
@@ -56,7 +60,8 @@ def reserve_inventory(
     now = iso(utcnow())
     with transaction(db_path) as tx:
         row = tx.execute(
-            "SELECT id, quantity, reserved_by FROM inventory_records WHERE id = ?",
+            "SELECT id, quantity, reserved_by, reserved_at"
+            " FROM inventory_records WHERE id = ?",
             (request.inventory_record_id,),
         ).fetchone()
         if row is None:
@@ -70,6 +75,9 @@ def reserve_inventory(
                 approval_id=request.approval_id,
                 quantity=row["quantity"],
                 reserved=True,
+                reserved_at=(
+                    parse_dt(row["reserved_at"]) if row["reserved_at"] else None
+                ),
             )
         if row["reserved_by"] is not None:
             raise ToolFailure(
@@ -91,6 +99,7 @@ def reserve_inventory(
         approval_id=request.approval_id,
         quantity=row["quantity"],
         reserved=True,
+        reserved_at=parse_dt(now),
     )
 
 
@@ -107,3 +116,37 @@ def release_inventory(
     return ReleaseInventoryOutput(
         approval_id=request.approval_id, released=True
     )
+
+
+def list_reservations(
+    db_path: str, ttl_seconds: int
+) -> ListReservationsOutput:
+    """Read-only saga view. TTL is advisory and never releases anything."""
+    now = utcnow()
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, sku_id, spec, quantity, reserved_by, reserved_at"
+            " FROM inventory_records WHERE reserved_by IS NOT NULL"
+            " ORDER BY reserved_at, id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    reservations: list[ReservationView] = []
+    for row in rows:
+        reserved_at = parse_dt(row["reserved_at"]) if row["reserved_at"] else now
+        age_seconds = max(0, int((now - reserved_at).total_seconds()))
+        reservations.append(
+            ReservationView(
+                inventory_record_id=row["id"],
+                sku_id=row["sku_id"],
+                spec=row["spec"],
+                quantity=row["quantity"],
+                approval_id=row["reserved_by"],
+                reserved_at=reserved_at,
+                age_seconds=age_seconds,
+                expires_at=reserved_at + timedelta(seconds=ttl_seconds),
+            )
+        )
+    return ListReservationsOutput(reservations=reservations, checked_at=now)

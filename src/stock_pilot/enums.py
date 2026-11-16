@@ -92,6 +92,17 @@ class RecoveryKind(str, Enum):
     APPROVED_WITHOUT_STAGING = "approved_without_staging"
     STAGING_ORPHANED = "staging_orphaned"
     INTERRUPTED_BEFORE_APPROVAL = "interrupted_before_approval"
+    RESERVATION_ORPHANED = "reservation_orphaned"
+    RESERVATION_STALE = "reservation_stale"
+
+
+class ReservationGcAction(str, Enum):
+    """What the reservation sweep did (or deliberately did not do)."""
+
+    RELEASED = "released"
+    RETAINED = "retained"
+    STALE = "stale"
+    FAILED = "failed"
 
 
 class ToolOutcome(str, Enum):
@@ -115,3 +126,18 @@ class TaskStatus(str, Enum):
     ABORTED_UNKNOWN_STATE = "aborted_unknown_state"
     ABORTED_FAILED = "aborted_failed"
     FAILED_VERIFICATION = "failed_verification"
+
+
+# A task in one of these states will never publish again, so a stock
+# reservation attached to it can be released safely.
+TERMINAL_TASK_STATUSES = frozenset(
+    {
+        TaskStatus.VERIFIED,
+        TaskStatus.ROLLED_BACK,
+        TaskStatus.ABORTED_NO_STOCK,
+        TaskStatus.ABORTED_NOT_FOUND,
+        TaskStatus.ABORTED_UNKNOWN_STATE,
+        TaskStatus.ABORTED_FAILED,
+        TaskStatus.FAILED_VERIFICATION,
+    }
+)

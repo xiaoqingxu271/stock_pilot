@@ -5,7 +5,7 @@
 ## 0. 启动（30 秒）
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q               # 100 passed
+./.venv/Scripts/python.exe -m pytest -q               # 111 passed
 ./.venv/Scripts/python.exe -m ruff check src tests
 ./.venv/Scripts/python.exe -m stock_pilot.demo        # http://127.0.0.1:8000/
 # --split 同时拉起两个 HTTP MCP Server 并拆成三个库；--fresh 只重建配置的演示库
@@ -99,9 +99,11 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http STOCK_PILOT_ADMIN_TOKEN=demo-admin-token \
 
 主动说明边界：split 布局下三个库彼此独立，发布链路是「复核 → 内部预留 →
 商城事务提交 → 释放预留」的 saga；提交后响应丢失时只做一次只读对账并采纳
-已提交事实，绝不重发写。预留目前没有 TTL，进程在预留后崩溃会留下占用，这是
-下一步要补的清理任务。静态 Token 只是演示级身份，生产应换 OIDC 并强制审批
-人与提交人分离。
+已提交事实，绝不重发写。进程在预留后崩溃会留下占用，恢复面板会显示
+`reservation_orphaned` 并提供「释放遗留预留」（`POST /reservations/gc`）；
+该接口只释放审批已终止或缺失的预留，审批仍可发布时即使超过 TTL 也只标记
+`reservation_stale`，不会抢走库存。静态 Token 只是演示级身份，生产应换 OIDC
+并强制审批人与提交人分离。
 
 ## 5. 收尾（30 秒）
 

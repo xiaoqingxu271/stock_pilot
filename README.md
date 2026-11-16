@@ -92,6 +92,8 @@ check_inventory → get_listing → update_price（审批）
 
 **拆分存储与发布 saga（E3）**：`split` 布局把库存、商城（含审批）与编排任务拆成三个库。商城库看不到库存表，因此发布链路改为 saga：复核库存 → 通过内部工具 `reserve_inventory` 预留 → `publish_listing` 在商城事务内提交并消费审批 → 回写任务 → 尽力释放预留。商城提交后响应丢失时，只做一次只读 `get_listing`：已按目标价上架就采纳并核对，绝不重发写操作；未提交则任务 `ABORTED_UNKNOWN_STATE` 并释放预留，staging 留给恢复面板人工撤回。补偿只撤回未提交的提案或释放预留，不会回滚已提交的商城事实；这里刻意不引入会重投写操作的 outbox。取舍与失败矩阵见 `docs/adr/0005-split-stores-and-publish-saga.md`。
 
+**预留 TTL 与清理（E5）**：`release_inventory` 是尽力补偿，进程若在预留后崩溃，库存会被长期占用。系统提供只读 `GET /reservations` 与 operator 触发的 `POST /reservations/gc`：清理只释放审批已 `consumed` / `rejected` / `abandoned`、审批缺失或任务已终态的预留；审批仍可发布且任务活跃的预留**绝不自动释放**。`STOCK_PILOT_RESERVATION_TTL`（默认 900 秒）只用于把超龄预留标记为 `reservation_stale` 并报警，不构成释放许可。`GET /recovery` 与审批台会显示 `reservation_orphaned` / `reservation_stale`，面板提供「释放遗留预留」按钮。设计见 `docs/adr/0006-reservation-ttl-and-gc.md`。
+
 **发布前复核**：审批可能持续数小时，库存不是审批时的快照。图在 `await_approval` 与 `publish` 之间增加 `recheck_stock`：库存不足、记录消失或复核工具失败时，系统不提交，而是把审批标记为 `abandoned` 并在同一事务里丢弃 staging；任务进入 `ROLLED_BACK`（库存不足）或 `ABORTED_UNKNOWN_STATE`（无法确认）。`abandoned` 不是人工拒绝，审计上区分开。
 
 **重启恢复**：`GET /recovery` 只读扫描中断态任务（已审批未提交、已拒绝/系统撤回未关闭、已提交未核对），以及写超时后遗留的 `price_staged` 提案。可自动继续的任务由 `POST /tasks/{id}/recover` 从图 checkpoint 恢复：已审批的任务继续走发布链路，已提交的任务只补做最终只读核对（绝不重复发布）。遗留提案只标注、不自动写；人工确认后可用 `POST /approvals/{id}/abandon` 撤回，该接口会先做一次只读对账，商城已提交则拒绝撤回。
@@ -184,7 +186,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 100 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 111 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -202,6 +204,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_observability.py`：`/metrics` 数值（任务、工具事件、耗时、熔断、降级）、JSON 日志字段与 `task_id`、白名单（Token 不入日志）、`/healthz` 降级。
 - `tests/test_reconnect.py`：HTTP MCP Server 停机 → 任务安全中止 → 同端口重启 → 自动重连 → 新任务完成，审计中只有一次成功 `publish_listing`。
 - `tests/test_split_stores.py`：三库隔离、预留互斥/幂等/释放、拆分 API 与指标跨库读取、MCP 预留工具路由，以及「商城已提交但响应丢失」时只读采纳且不重发写。
+- `tests/test_reservations.py`：清理只释放审批终止/缺失/任务终态的预留；活跃审批的预留即使超过 TTL 也只标记 stale 且仍能完成发布；清理幂等、operator 鉴权、恢复扫描与指标。
 
 ## 目录
 
@@ -236,7 +239,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 - `docs/demo.md`：约 8 分钟的面试演示脚本，含失败路径与拆分/鉴权演示。
 - `docs/screenshots/console.png`：审批台截图（演示数据：待审批 / 映射歧义 / 已核对 / 库存终止）。
 - `docs/observability.md`：指标、告警规则、结构化日志与断线重连语义。
-- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理、三库与发布 saga 的决策记录。
+- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理、三库与发布 saga、预留 TTL 与清理的决策记录。
 
 ## 设计取舍与生产化
 
@@ -244,7 +247,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 
 生产化继续方向：
 
-1. 库存预留增加 TTL 与回收任务，避免进程在预留后崩溃造成长期占用。
+1. 预留清理已由 operator 触发；生产可按 TTL 定时调度 `POST /reservations/gc`，并接入告警。
 2. Postgres 替换 SQLite；通知类事件可引入 outbox，但写操作仍不得重投。
 3. 静态 Token 换成 OIDC / 真实登录；只读鉴权已可通过 `STOCK_PILOT_REQUIRE_READ_AUTH` 开启，生产再接入统一网关。
 4. 指标与结构化日志已落地（Prometheus `/metrics`、JSON 日志）；生产再接入告警平台、日志聚合与审批审计导出。

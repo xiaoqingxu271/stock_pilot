@@ -8,15 +8,17 @@ it never writes to any store.
 
 from __future__ import annotations
 
-from stock_pilot.db import connect
+from stock_pilot.db import connect, parse_dt, utcnow
 from stock_pilot.enums import (
     ApprovalStatus,
     ListingStatus,
     RecoveryKind,
+    ReservationGcAction,
     StagingStatus,
     TaskStatus,
 )
 from stock_pilot.models import RecoveryIssue, from_cents
+from stock_pilot.reservations import disposition
 
 _WATCHED_STATUSES = (
     TaskStatus.RECEIVED.value,
@@ -26,10 +28,15 @@ _WATCHED_STATUSES = (
 
 
 def scan(
-    db_path: str, *, mall_db_path: str | None = None
+    db_path: str,
+    *,
+    mall_db_path: str | None = None,
+    inventory_db_path: str | None = None,
+    reservation_ttl_seconds: int = 900,
 ) -> list[RecoveryIssue]:
-    """Join task state with mall state across one or two store files."""
+    """Join task state with mall and inventory state across store files."""
     mall_path = mall_db_path or db_path
+    inventory_path = inventory_db_path or db_path
 
     task_conn = connect(db_path)
     try:
@@ -85,6 +92,16 @@ def scan(
         ).fetchall()
     finally:
         mall_conn.close()
+
+    inventory_conn = connect(inventory_path)
+    try:
+        reservation_rows = inventory_conn.execute(
+            "SELECT id, sku_id, spec, reserved_by, reserved_at"
+            " FROM inventory_records WHERE reserved_by IS NOT NULL"
+            " ORDER BY reserved_at, id"
+        ).fetchall()
+    finally:
+        inventory_conn.close()
 
     issues: list[RecoveryIssue] = []
     reported_tasks: set[str] = set()
@@ -154,6 +171,54 @@ def scan(
                 approval_id=row["approval_id"],
                 approval_status=ApprovalStatus(row["approval_status"]),
                 staging_status=StagingStatus(row["staging_status"]),
+            )
+        )
+
+    # A crash between reserve and release leaves stock held forever. Report
+    # only reservations whose approval can no longer publish; an approved
+    # proposal that is still active is a normal saga step, never a leak.
+    now = utcnow()
+    for row in reservation_rows:
+        reserved_at = (
+            parse_dt(row["reserved_at"]) if row["reserved_at"] else now
+        )
+        age_seconds = max(0, int((now - reserved_at).total_seconds()))
+        approval_status = approvals.get(row["reserved_by"])
+        task = task_by_approval.get(row["reserved_by"])
+        task_status = (
+            TaskStatus(task["task_status"]) if task is not None else None
+        )
+        action, message = disposition(
+            approval_status,
+            task_status,
+            age_seconds,
+            reservation_ttl_seconds,
+        )
+        if action is ReservationGcAction.RETAINED:
+            continue
+        kind = (
+            RecoveryKind.RESERVATION_ORPHANED
+            if action is ReservationGcAction.RELEASED
+            else RecoveryKind.RESERVATION_STALE
+        )
+        task_id = task["task_id"] if task is not None else None
+        issues.append(
+            RecoveryIssue(
+                kind=kind,
+                message=f"库存预留在任务结束后仍未释放：{message}",
+                task_id=task_id,
+                sku_id=row["sku_id"],
+                spec=row["spec"],
+                task_status=task_status,
+                target_price=(
+                    from_cents(task["target_price_cents"])
+                    if task is not None
+                    else None
+                ),
+                approval_id=row["reserved_by"],
+                approval_status=approval_status,
+                inventory_record_id=row["id"],
+                reserved_at=reserved_at,
             )
         )
 

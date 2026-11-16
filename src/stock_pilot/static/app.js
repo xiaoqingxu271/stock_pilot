@@ -40,6 +40,8 @@
     approved_without_staging: "有效提案缺失",
     staging_orphaned: "遗留提案",
     interrupted_before_approval: "执行中断",
+    reservation_orphaned: "遗留库存预留",
+    reservation_stale: "预留超时",
   };
 
   const state = {
@@ -255,7 +257,9 @@
         "card-meta",
         `当前 ${issue.task_status ? statusMeta(issue.task_status).label : "未知"} · 目标 ${money(
           issue.target_price
-        )} · listing ${issue.listing_id || "—"}`
+        )} · listing ${issue.listing_id || "—"}${
+          issue.inventory_record_id ? ` · 库存记录 ${issue.inventory_record_id}` : ""
+        }`
       )
     );
 
@@ -337,6 +341,47 @@
           busy = false;
         }
       });
+    }
+
+    if (
+      (issue.kind === "reservation_orphaned" ||
+        issue.kind === "reservation_stale") &&
+      issue.inventory_record_id
+    ) {
+      const orphaned = issue.kind === "reservation_orphaned";
+      const label = orphaned ? "释放遗留预留" : "检查并清理预留";
+      const sweep = h("button", "btn btn-danger-outline btn-small", label);
+      sweep.type = "button";
+      sweep.title =
+        "只释放审批已终止或缺失的预留；审批仍可发布的预留会保留并报告";
+
+      let busy = false;
+      sweep.addEventListener("click", async () => {
+        if (busy) return;
+        busy = true;
+        sweep.disabled = true;
+        sweep.textContent = "清理中…";
+        state.mutating += 1;
+        try {
+          const result = await api("/reservations/gc", {
+            method: "POST",
+            body: "{}",
+          });
+          toast(
+            `预留清理：释放 ${result.released} 个 · 保留 ${result.retained} 个 · 需核查 ${result.stale} 个`,
+            result.released > 0 ? "success" : "info"
+          );
+          await refresh({ force: true });
+        } catch (error) {
+          toast(error.message, "error");
+          sweep.disabled = false;
+          sweep.textContent = label;
+        } finally {
+          state.mutating -= 1;
+          busy = false;
+        }
+      });
+      actions.append(sweep);
     }
 
     if (actions.childElementCount) card.append(actions);

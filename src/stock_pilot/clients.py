@@ -40,6 +40,8 @@ from stock_pilot.models import (
     CheckInventoryOutput,
     GetListingInput,
     GetListingOutput,
+    ListReservationsInput,
+    ListReservationsOutput,
     PublishListingInput,
     PublishListingOutput,
     ReleaseInventoryInput,
@@ -80,6 +82,10 @@ class ToolClient(Protocol):
     def release_inventory(
         self, request: ReleaseInventoryInput
     ) -> ReleaseInventoryOutput: ...
+
+    def list_reservations(
+        self, request: ListReservationsInput | None = None
+    ) -> ListReservationsOutput: ...
 
     # Health probe used by readiness checks.
     def is_available(self) -> bool: ...
@@ -222,6 +228,9 @@ class MCPToolClient(_LocalApprovalPlane):
         merged = dict(os.environ if env is None else env)
         merged["STOCK_PILOT_DB"] = self.settings.store_orchestrator
         merged["STOCK_PILOT_DB_LAYOUT"] = self.settings.db_layout
+        merged["STOCK_PILOT_RESERVATION_TTL"] = str(
+            self.settings.reservation_ttl_seconds
+        )
         if self.settings.split_stores:
             merged["STOCK_PILOT_INVENTORY_DB"] = self.settings.store_inventory
             merged["STOCK_PILOT_MALL_DB"] = self.settings.store_mall
@@ -506,6 +515,16 @@ class MCPToolClient(_LocalApprovalPlane):
             "release_inventory", request, ReleaseInventoryOutput, is_write=True
         )
 
+    def list_reservations(
+        self, request: ListReservationsInput | None = None
+    ) -> ListReservationsOutput:
+        return self._run(
+            "list_reservations",
+            request or ListReservationsInput(),
+            ListReservationsOutput,
+            is_write=False,
+        )
+
     def is_available(self) -> bool:
         return not self._closed and self._session is not None
 
@@ -576,6 +595,11 @@ class SplitMCPToolClient(_LocalApprovalPlane):
         self, request: ReleaseInventoryInput
     ) -> ReleaseInventoryOutput:
         return self._inventory.release_inventory(request)
+
+    def list_reservations(
+        self, request: ListReservationsInput | None = None
+    ) -> ListReservationsOutput:
+        return self._inventory.list_reservations(request)
 
     def is_available(self) -> bool:
         return self._inventory.is_available() and self._mall.is_available()

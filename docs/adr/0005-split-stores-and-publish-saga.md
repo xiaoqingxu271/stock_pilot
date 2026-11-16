@@ -69,7 +69,7 @@ Failure handling:
 | reserve fails (zero / reserved / error) | abandon approval, release (no-op), stop before mall |
 | mall rejects (approval/staging/listing guard) | abandon approval, stop; no retry |
 | mall commit uncertain (timeout / transport) | one read-only `get_listing`; committed at target price → adopt, mark published, verify; otherwise `ABORTED_UNKNOWN_STATE`, never re-publish |
-| crash after reserve, before release | reservation leaks (documented limitation; TTL cleanup is future work) |
+| crash after reserve, before release | reservation leaks until the conservative sweep in ADR 0006 releases it |
 
 Compensation never reverts a committed mall fact. If the mall committed, the
 orchestrator adopts it; if it did not, the proposal is abandoned and staging
@@ -92,8 +92,10 @@ must not re-drive writes.
 - There are no cross-store foreign keys. `listings.inventory_record_id` is a
   reference checked by the graph's mapping guard, not by SQLite.
 - In-process and HTTP split tests cover happy path, reservation semantics,
-  reservation routes over MCP, a lost commit response, and a failure before
+  reservation listing over MCP, a lost commit response, and a failure before
   commit.
-- Remaining limitations: no reservation TTL/GC, no notification outbox,
-  SQLite rather than Postgres. The reservation tool set is internal API, not a
-  fifth model capability.
+- Reservations left by a crash are swept conservatively (ADR 0006); the sweep
+  never releases a reservation whose approval can still publish.
+- Reservation TTL and cleanup are added in ADR 0006. Remaining limitations:
+  no notification outbox, SQLite rather than Postgres. The reservation tool
+  set is internal API, not a fifth model capability.

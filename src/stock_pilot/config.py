@@ -26,6 +26,10 @@ class Settings:
     read_max_retries: int = 2
     circuit_failure_threshold: int = 3
     circuit_cooldown_seconds: float = 30.0
+    # Advisory age after which a live stock reservation is flagged for an
+    # operator. It never triggers an automatic release: an approved proposal
+    # may still be about to publish.
+    reservation_ttl_seconds: int = 900
     # Production split: two HTTP MCP servers over a shared demo database.
     inventory_mcp_url: str = "http://127.0.0.1:8101/mcp"
     mall_mcp_url: str = "http://127.0.0.1:8102/mcp"
@@ -43,6 +47,8 @@ class Settings:
             raise ValueError(
                 f"db_layout must be 'shared' or 'split', got {self.db_layout!r}"
             )
+        if self.reservation_ttl_seconds <= 0:
+            raise ValueError("reservation_ttl_seconds must be positive")
 
     @property
     def split_stores(self) -> bool:
@@ -87,6 +93,9 @@ class Settings:
             ),
             circuit_cooldown_seconds=float(
                 os.environ.get("STOCK_PILOT_CIRCUIT_COOLDOWN", "30")
+            ),
+            reservation_ttl_seconds=int(
+                os.environ.get("STOCK_PILOT_RESERVATION_TTL", "900")
             ),
             inventory_mcp_url=os.environ.get(
                 "STOCK_PILOT_INVENTORY_URL", "http://127.0.0.1:8101/mcp"

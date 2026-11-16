@@ -8,6 +8,7 @@ circuits are also returned structurally so the orchestrator can apply
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import TypeVar, cast
 
 from stock_pilot import approval, inventory, mall
@@ -26,6 +27,8 @@ from stock_pilot.models import (
     CheckInventoryOutput,
     GetListingInput,
     GetListingOutput,
+    ListReservationsInput,
+    ListReservationsOutput,
     PublishListingInput,
     PublishListingOutput,
     ReleaseInventoryInput,
@@ -43,7 +46,12 @@ logger = logging.getLogger(__name__)
 TOutput = TypeVar("TOutput", bound=ToolOutput)
 
 
-_INVENTORY_TOOLS = {"check_inventory", "reserve_inventory", "release_inventory"}
+_INVENTORY_TOOLS = {
+    "check_inventory",
+    "reserve_inventory",
+    "release_inventory",
+    "list_reservations",
+}
 
 
 class StockPilotTools:
@@ -160,13 +168,15 @@ class StockPilotTools:
     def reserve_inventory(
         self, request: ReserveInventoryInput
     ) -> ReserveInventoryOutput:
-        return self._run(
+        result = self._run(
             "reserve_inventory",
             inventory.reserve_inventory,
             request,
             ReserveInventoryOutput,
             is_write=True,
         )
+        self._add_expiry(result)
+        return result
 
     def release_inventory(
         self, request: ReleaseInventoryInput
@@ -178,6 +188,27 @@ class StockPilotTools:
             ReleaseInventoryOutput,
             is_write=True,
         )
+
+    def list_reservations(self) -> ListReservationsOutput:
+        ttl = self.settings.reservation_ttl_seconds
+
+        def read(db_path: str, _request: ListReservationsInput):
+            return inventory.list_reservations(db_path, ttl)
+
+        return self._run(
+            "list_reservations",
+            read,
+            ListReservationsInput(),
+            ListReservationsOutput,
+            is_write=False,
+        )
+
+    def _add_expiry(self, result: ReserveInventoryOutput) -> None:
+        """Attach the advisory expiry; the sweep still decides on approval."""
+        if result.ok and result.reserved_at is not None:
+            result.expires_at = result.reserved_at + timedelta(
+                seconds=self.settings.reservation_ttl_seconds
+            )
 
     # -- health ------------------------------------------------------------
 

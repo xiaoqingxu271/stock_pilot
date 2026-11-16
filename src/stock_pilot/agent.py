@@ -23,6 +23,7 @@ from stock_pilot import audit, tasks
 from stock_pilot.clients import ToolClient
 from stock_pilot.db import utcnow
 from stock_pilot.enums import (
+    TERMINAL_TASK_STATUSES,
     ApprovalDecision,
     ApprovalStatus,
     ErrorCode,
@@ -47,15 +48,7 @@ from stock_pilot.models import (
 
 logger = logging.getLogger(__name__)
 
-TERMINAL = {
-    TaskStatus.VERIFIED,
-    TaskStatus.ROLLED_BACK,
-    TaskStatus.ABORTED_NO_STOCK,
-    TaskStatus.ABORTED_NOT_FOUND,
-    TaskStatus.ABORTED_UNKNOWN_STATE,
-    TaskStatus.ABORTED_FAILED,
-    TaskStatus.FAILED_VERIFICATION,
-}
+TERMINAL = TERMINAL_TASK_STATUSES
 
 
 class AgentState(TypedDict, total=False):

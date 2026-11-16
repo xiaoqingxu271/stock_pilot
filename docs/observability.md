@@ -14,15 +14,19 @@ StockPilot 的观测面全部从权威状态派生：任务与工具时间线来
 | `stock_pilot_tool_events_total` | counter | `tool` / `outcome` / `error_code` | 工具尝试次数；仅统计带任务的编排侧调用 |
 | `stock_pilot_tool_latency_ms` | histogram | `tool` | 工具尝试耗时（毫秒），桶 10ms → 10s |
 | `stock_pilot_approvals_pending` | gauge | — | 等待人工决策的审批数 |
-| `stock_pilot_recovery_issues` | gauge | — | 需要人工关注的中断态任务 + 遗留 staging |
+| `stock_pilot_recovery_issues` | gauge | — | 需要人工关注的中断态任务 + 遗留 staging + 遗留预留 |
+| `stock_pilot_reservations_open` | gauge | — | 当前被发布预留占用的库存记录数 |
+| `stock_pilot_reservations_stale` | gauge | — | 存活超过 `STOCK_PILOT_RESERVATION_TTL` 的活跃预留数 |
 | `stock_pilot_circuit_open` | gauge | `tool` | 熔断器当前是否拒绝调用（1/0） |
 | `stock_pilot_tool_client_available` | gauge | — | 工具客户端是否持有可用会话（1/0） |
 
 MCP 模式下，工具服务端也会把尝试写入共享演示库；服务端行没有 `task_id`，
 因此指标只统计 `task_id IS NOT NULL` 的编排侧记录，避免双倍计数。
 
-`split` 布局下任务与工具事件在 `orchestrator.db`，审批在 `mall.db`；
-collector 分别读取两个库再组装，不需要跨库 SQL。
+`split` 布局下任务与工具事件在 `orchestrator.db`，审批在 `mall.db`，
+预留计数在 `inventory.db`；collector 分别读取三个库再组装，不需要跨库 SQL。
+`stock_pilot_reservations_stale` 只说明预留超过 TTL，**不表示可以强制释放**：
+审批仍可发布的预留由清理接口保留，详见 `docs/adr/0006`。
 
 `GET /healthz` 与指标同源：数据库不可读或工具客户端不可用时返回 `503` 与
 `status=degraded`，同时暴露 `pending_approvals`、`recovery_issues`。
@@ -78,7 +82,14 @@ groups:
         for: 5m
         labels: { severity: warning }
         annotations:
-          summary: 存在中断态任务或遗留提案，检查 GET /recovery
+          summary: 存在中断态任务、遗留提案或预留，检查 GET /recovery
+
+      - alert: StockPilotReservationStale
+        expr: stock_pilot_reservations_stale > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: 活跃库存预留超过 TTL，核查任务状态后再决定是否清理
 ```
 
 超时率分母为 0 时比值不产生样本，规则自然不会触发。熔断告警只说明调用被
