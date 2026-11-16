@@ -641,9 +641,13 @@ def start_task(
     request: CreateTaskRequest,
     *,
     idempotency_key: str | None = None,
+    submitted_by: str | None = None,
 ) -> TaskView:
     task = tasks.create_task(
-        client.settings.db_path, request, idempotency_key=idempotency_key
+        client.settings.db_path,
+        request,
+        idempotency_key=idempotency_key,
+        submitted_by=submitted_by,
     )
     with audit.task_context(task.task_id):
         graph.invoke(initial_state(task), thread_config(task.task_id))

@@ -105,14 +105,16 @@ def list_queue(
         "SELECT a.id AS approval_id, t.id AS task_id, a.listing_id,"
         " l.sku_id, l.title, l.spec, l.price_cents AS current_price_cents,"
         " a.original_price_cents, a.new_price_cents, a.proposal_reason,"
-        " a.status, a.decision_note, a.decided_by, a.created_at, a.decided_at,"
-        " a.abandoned_at, a.abandon_reason, a.abandoned_by"
+        " a.status, a.decision_note, a.decided_by, tk.submitted_by,"
+        " a.created_at, a.decided_at, a.abandoned_at, a.abandon_reason,"
+        " a.abandoned_by"
         " FROM approvals a"
         " JOIN listings l ON l.id = a.listing_id"
         " LEFT JOIN ("
         "   SELECT approval_id, MIN(id) AS id FROM tasks"
         "   WHERE approval_id IS NOT NULL GROUP BY approval_id"
         " ) t ON t.approval_id = a.id"
+        " LEFT JOIN tasks tk ON tk.id = t.id"
     )
     params: list[object] = []
     if status is not None:
@@ -142,6 +144,7 @@ def list_queue(
             status=ApprovalStatus(row["status"]),
             decision_note=row["decision_note"],
             decided_by=row["decided_by"],
+            submitted_by=row["submitted_by"],
             created_at=parse_dt(row["created_at"]),
             decided_at=(
                 parse_dt(row["decided_at"]) if row["decided_at"] else None

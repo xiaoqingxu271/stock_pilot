@@ -178,7 +178,7 @@ def create_app(
     def submit_task(
         request: CreateTaskRequest,
         response: Response,
-        _principal: Principal | None = Depends(_require(Role.AGENT)),
+        principal: Principal | None = Depends(_require(Role.AGENT)),
         idempotency_key: str | None = Header(
             default=None, alias="Idempotency-Key", max_length=128
         ),
@@ -195,7 +195,11 @@ def create_app(
                 return _replay_existing(existing, request)
         try:
             return start_task(
-                client, graph, request, idempotency_key=key
+                client,
+                graph,
+                request,
+                idempotency_key=key,
+                submitted_by=principal.name if principal is not None else None,
             )
         except sqlite3.IntegrityError:
             existing = (

@@ -153,6 +153,7 @@ class ApprovalQueueItem(BaseModel):
     status: ApprovalStatus
     decision_note: str | None = None
     decided_by: str | None = None
+    submitted_by: str | None = None
     created_at: datetime
     decided_at: datetime | None = None
     abandoned_at: datetime | None = None
@@ -244,6 +245,7 @@ class TaskView(BaseModel):
     target_price: Money
     reason: str
     idempotency_key: str | None = None
+    submitted_by: str | None = None
     status: TaskStatus
     listing_id: str | None = None
     approval_id: str | None = None

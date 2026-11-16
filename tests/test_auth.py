@@ -60,6 +60,7 @@ def test_missing_or_wrong_token_is_rejected(secured):
 
 def test_agent_can_submit_but_not_decide(secured):
     task = create_task(secured, AGENT)
+    assert task["submitted_by"] == "agent"
 
     forbidden = secured.post(
         f"/approvals/{task['approval_id']}/decision",
@@ -76,6 +77,9 @@ def test_agent_can_submit_but_not_decide(secured):
 
 def test_operator_identity_overrides_the_request_body(secured):
     task = create_task(secured, AGENT)
+    queue = secured.get("/approvals/queue").json()
+    assert queue[0]["submitted_by"] == "agent"
+
     decided = secured.post(
         f"/approvals/{task['approval_id']}/decision",
         json={"decision": "approve", "decided_by": "冒充的操作人"},
@@ -90,6 +94,7 @@ def test_operator_identity_overrides_the_request_body(secured):
 
 def test_admin_token_covers_agent_and_operator_actions(secured):
     task = create_task(secured, ADMIN)
+    assert task["submitted_by"] == "admin"
     decided = secured.post(
         f"/approvals/{task['approval_id']}/decision",
         json={"decision": "approve"},

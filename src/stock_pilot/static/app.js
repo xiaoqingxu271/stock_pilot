@@ -368,7 +368,9 @@
       h(
         "p",
         "card-meta",
-        `SKU ${item.sku_id} · ${item.spec} · listing ${item.listing_id}`
+        `SKU ${item.sku_id} · ${item.spec} · listing ${item.listing_id} · 提交人 ${
+          item.submitted_by || "—"
+        }`
       )
     );
     head.append(titleWrap, approvalChip(item.status));
@@ -726,6 +728,7 @@
     const kv = h("dl", "kv");
     addKv(kv, "任务 ID", task.task_id, true);
     addKv(kv, "审批 ID", task.approval_id || "—", true);
+    addKv(kv, "提交人", task.submitted_by || "—");
     addKv(
       kv,
       "原价 / 最终价",

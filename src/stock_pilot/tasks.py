@@ -23,14 +23,15 @@ def create_task(
     request: CreateTaskRequest,
     *,
     idempotency_key: str | None = None,
+    submitted_by: str | None = None,
 ) -> TaskView:
     task_id = new_id("task")
     now = iso(utcnow())
     with transaction(db_path) as tx:
         tx.execute(
             "INSERT INTO tasks (id, sku_id, spec, target_price_cents, reason,"
-            " idempotency_key, status, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " idempotency_key, submitted_by, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 request.sku_id,
@@ -38,6 +39,7 @@ def create_task(
                 to_cents(request.target_price),
                 request.reason,
                 idempotency_key,
+                submitted_by,
                 TaskStatus.RECEIVED.value,
                 now,
                 now,
@@ -170,6 +172,7 @@ def _row_to_task(row: sqlite3.Row) -> TaskView:
         target_price=from_cents(row["target_price_cents"]),
         reason=row["reason"],
         idempotency_key=row["idempotency_key"],
+        submitted_by=row["submitted_by"],
         status=TaskStatus(row["status"]),
         listing_id=row["listing_id"],
         approval_id=row["approval_id"],

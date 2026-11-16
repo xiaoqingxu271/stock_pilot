@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     target_price_cents   INTEGER NOT NULL,
     reason               TEXT NOT NULL,
     idempotency_key      TEXT,
+    submitted_by         TEXT,
     status               TEXT NOT NULL,
     listing_id           TEXT,
     approval_id          TEXT,
@@ -169,6 +170,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "approvals", "abandon_reason", "abandon_reason TEXT")
     _ensure_column(conn, "approvals", "abandoned_by", "abandoned_by TEXT")
     _ensure_column(conn, "tasks", "idempotency_key", "idempotency_key TEXT")
+    _ensure_column(conn, "tasks", "submitted_by", "submitted_by TEXT")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_idempotency_key"
         " ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL"

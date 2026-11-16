@@ -42,6 +42,7 @@ def test_api_happy_path(client, settings: Settings):
     assert task["status"] == "awaiting_approval"
     assert task["listing_id"] == "LST-001"
     assert task["approval_id"]
+    assert task["submitted_by"] is None  # unauthenticated dev mode
 
     decision = client.post(
         f"/approvals/{task['approval_id']}/decision",

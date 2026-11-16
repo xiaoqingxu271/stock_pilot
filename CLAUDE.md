@@ -171,7 +171,7 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 **服务层**
 
 - `api.py`：操作接口 `POST /tasks`（支持 `Idempotency-Key`，冲突返回 `IDEMPOTENCY_CONFLICT`；需 agent）、`POST /approvals/{approval_id}/decision`（可带 `decided_by`；需 operator）、`POST /approvals/{approval_id}/abandon`（需 operator）、`POST /tasks/{task_id}/mapping`、`POST /tasks/{task_id}/recover`（需 operator）；只读接口 `GET /tasks`、`GET /tasks/{id}`、`GET /tasks/{id}/events`、`GET /recovery`、`GET /healthz`（数据库/工具客户端不可用时 503 + `degraded`）、`GET /approvals`、`GET /approvals/{id}`、`GET /approvals/queue`（联表返回商品与任务上下文）。配置 Token 后 `decided_by` / `abandoned_by` 以身份为准，忽略请求体；未配置 Token 为本地演示模式。
-- `tasks.py`：任务记录 CRUD、`find_task_by_idempotency_key()` 与 JSON 字段序列化。
+- `tasks.py`：任务记录 CRUD、`find_task_by_idempotency_key()` 与 JSON 字段序列化；`submitted_by` 记录提交人（鉴权开启时来自 agent 身份）。
 - `static/`：零构建的原生 HTML/CSS/JS 审批台，`GET /` 返回页面。页面每 5 秒自动刷新，审批备注草稿、映射选择与审批人姓名在重绘时保留；拒绝必须填写原因；存在异常态任务时显示「待恢复任务」面板，`published_verify_pending` 可补核对，`staging_orphaned` 提供「撤回遗留提案」按钮。静态资源通过 `pyproject.toml` 的 `package-data` 打进 wheel。
 
 **演示数据（`db.py:_seed_demo_data`）**
@@ -194,6 +194,11 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http ./.venv/Scripts/python.exe -m stock_pilot.api
 - `tests/test_auth.py`：角色鉴权——缺失/错误 Token 401、跨角色 403、admin 覆盖、身份覆盖请求体、撤回留痕 `abandoned_by`。
 - `tests/test_recovery.py`：进程重启后续审批/映射、恢复扫描与恢复接口（含 `published` 只读补核对）、任务/审批幂等、操作者留痕、工具事件时间线、发布前库存复核与系统撤回、遗留提案人工撤回与拒绝条件。
 
+## 文档
+
+- `docs/demo.md`：面试演示脚本（含失败路径、恢复、拆分与鉴权）。
+- `docs/adr/`：0001 两阶段审批提交、0002 失败即停止写、0003 拆分与静态 Token、0004 恢复与人工清理。
+
 ## 实现状态
 
-工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复（含已提交任务补核对）、任务/审批幂等、工具调用审计、发布前与提交事务内库存复核、遗留提案人工清理、健康检查均已落地；B1 已完成库存/商城两个 Streamable HTTP MCP Server 与静态 Token 角色鉴权。`pytest -q` 当前 76 个用例通过，`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。尚未实现：各服务独立数据库与 saga 补偿、OIDC / 真实登录、只读接口鉴权、Postgres。
+工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、重启恢复（含已提交任务补核对）、任务/审批幂等、工具调用审计、发布前与提交事务内库存复核、遗留提案人工清理、健康检查均已落地；B1 已完成库存/商城两个 Streamable HTTP MCP Server 与静态 Token 角色鉴权；任务、审批、撤回分别留痕提交人 / 审批人 / 撤回人。`pytest -q` 当前 76 个用例通过，`ruff check` 通过。CI 在 `.github/workflows/ci.yml`（Ubuntu + Windows）。尚未实现：各服务独立数据库与 saga 补偿、OIDC / 真实登录、只读接口鉴权、Postgres。

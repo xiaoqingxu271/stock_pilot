@@ -1,0 +1,103 @@
+# 面试演示脚本（约 8 分钟）
+
+目标：让面试官看到「受约束 Agent」的证据，而不只是 happy path。
+
+## 0. 启动（30 秒）
+
+```bash
+./.venv/Scripts/python.exe -m pytest -q          # 76 passed
+./.venv/Scripts/python.exe -m ruff check src tests
+./.venv/Scripts/python.exe -m stock_pilot.api    # http://127.0.0.1:8000/
+```
+
+先指出页面右上角「管理令牌」：未配置 Token 时留空即可；配置 Token 后它就是
+操作身份入口。再看底部安全承诺与执行链路的 7 个步骤。
+
+## 1. Happy path（1 分钟）
+
+1. 点「正常调价」，提交 `SKU-TSHIRT-001 / 白色-M / 59.00`。
+2. 指向审批卡：商城现价仍是 ¥79.00，提案只进了审批队列与 staging。
+3. 填审批人，点「通过」。
+4. 任务变为「已核对」，详情里能看到最终价、上架状态与核对时间。
+
+要讲的三点：
+
+- `update_price` 只写 staging + approval；`publish_listing` 才在**同一事务**
+  里改价、上架、消费审批。
+- 最终核对复用只读 `get_listing`，结果写进任务记录。
+- `GET /tasks/{id}/events` 是每次工具尝试的时间线，不是一条「成功」日志。
+
+```bash
+curl -s localhost:8000/tasks/<task_id>/events
+```
+
+## 2. 三种失败路径（2 分钟）
+
+### 库存不足
+
+点「库存不足」提交 `SKU-HOODIE-003`：任务直接 `aborted_no_stock`，审批队列
+为空。强调「零写操作」。
+
+### 映射歧义
+
+点「映射歧义」提交 `SKU-AMBIG-002`：任务挂起并列出两个候选，规格不匹配的
+候选被禁用。人工选定后才进入审批。强调「系统不猜」。
+
+### 审批拒绝
+
+任意提案点「拒绝」，必须填原因。任务 `rolled_back`，staging 丢弃，商城价格
+不变。
+
+### 审批期间库存归零（可选，30 秒）
+
+提交提案后，在另一个终端执行：
+
+```bash
+./.venv/Scripts/python.exe -c "import sqlite3; c=sqlite3.connect('data/stock_pilot.db'); c.execute(\"UPDATE inventory_records SET quantity=0 WHERE id='INV-001'\"); c.commit()"
+```
+
+再点「通过」：任务 `rolled_back / INSUFFICIENT_STOCK`，审批状态 `abandoned`，
+staging 已丢弃，商城不变。强调 `abandoned` 是系统撤回，不是人工拒绝，审计上
+区分开；提交事务内还有第二道库存校验。
+
+## 3. 恢复与幂等（1.5 分钟）
+
+1. 提交一个提案，重启 API。
+2. 审批队列仍在，继续审批即可完成。
+3. 用 SQL 模拟「审批已通过但进程在恢复前崩溃」：
+
+```bash
+./.venv/Scripts/python.exe -c "import sqlite3,datetime; c=sqlite3.connect('data/stock_pilot.db'); c.execute(\"UPDATE approvals SET status='approved', decided_at=? WHERE status='pending'\",(datetime.datetime.utcnow().isoformat(),)); c.commit()"
+```
+
+刷新页面：出现「待恢复任务」面板，点「恢复执行」，只执行已批准的
+`publish_listing`，不新增写决策。
+
+4. 带同一个 `Idempotency-Key` 连续提交两次，只有一个任务、一条审批。
+
+## 4. 生产化拆分 + 鉴权（2 分钟）
+
+```bash
+export STOCK_PILOT_AGENT_TOKEN=demo-agent-token
+export STOCK_PILOT_OPERATOR_TOKEN=demo-operator-token
+./.venv/Scripts/python.exe -m stock_pilot.mcp_inventory &
+./.venv/Scripts/python.exe -m stock_pilot.mcp_mall &
+STOCK_PILOT_TOOL_CLIENT=mcp-http STOCK_PILOT_ADMIN_TOKEN=demo-admin-token \
+  ./.venv/Scripts/python.exe -m stock_pilot.api
+```
+
+- 不加 Token 调 `POST /tasks` 得到 `401`；用 operator Token 提交得到 `403`；
+  admin Token 可以走完整流程。
+- 在页面「管理令牌」填 admin Token，完成一次调价。`decided_by` 与
+  `abandoned_by` 来自 Token 身份，请求体里的值会被忽略。
+- 库存与商城是两个独立 HTTP MCP Server，编排层按工具路由；审批面留在编排
+  进程，因为它是人机管理面。
+
+主动说明边界：两个工具 Server 目前共享同一个 SQLite 文件；拆成独立数据库
+后，两阶段提交要改成 saga / 补偿。静态 Token 只是演示级身份，生产应换 OIDC
+并强制审批人与提交人分离。
+
+## 5. 收尾（30 秒）
+
+`GET /healthz` 返回数据库与工具客户端就绪状态（不可用时 503），部署层据此
+摘流量。整个设计文档见 `README.md`，关键取舍见 `docs/adr/`。
