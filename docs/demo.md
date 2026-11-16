@@ -5,7 +5,7 @@
 ## 0. 启动（30 秒）
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q               # 120 passed
+./.venv/Scripts/python.exe -m pytest -q               # 129 passed
 ./.venv/Scripts/python.exe -m ruff check src tests
 ./.venv/Scripts/python.exe -m stock_pilot.demo        # http://127.0.0.1:8000/
 # --split 同时拉起两个 HTTP MCP Server 并拆成三个库；--fresh 只重建配置的演示库
@@ -102,7 +102,8 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http STOCK_PILOT_ADMIN_TOKEN=demo-admin-token \
 已提交事实，绝不重发写。进程在预留后崩溃会留下占用，恢复面板会显示
 `reservation_orphaned` 并提供「释放遗留预留」（`POST /reservations/gc`）；
 该接口只释放审批已终止或缺失的预留，审批仍可发布时即使超过 TTL 也只标记
-`reservation_stale`，不会抢走库存。静态 Token 只是演示级身份，生产应换 OIDC
+`reservation_stale`，不会抢走库存。长驻部署可设置
+`STOCK_PILOT_RESERVATION_GC_INTERVAL` 让进程周期执行同一清理（默认 0 关闭）。静态 Token 只是演示级身份，生产应换 OIDC
 并强制审批人与提交人分离。
 
 ### 预留清理（可选，30 秒）

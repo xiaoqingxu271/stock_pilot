@@ -116,8 +116,20 @@ def create_app(
     mall_db = settings.store_mall
     # Notification-only worker: it is constructed without any tool client.
     outbox_worker = notifications.OutboxWorker(
-        db_path, interval_seconds=settings.outbox_interval_seconds
+        db_path,
+        interval_seconds=settings.outbox_interval_seconds,
+        max_attempts=settings.outbox_max_attempts,
+        retention_seconds=settings.outbox_retention_seconds,
     )
+    # Optional convenience scheduler. It runs the same conservative sweep as
+    # POST /reservations/gc; it is off by default and never force-expires.
+    reservation_sweeper: reservations.ReservationSweeper | None = None
+    if settings.split_stores and settings.reservation_gc_interval_seconds > 0:
+        reservation_sweeper = reservations.ReservationSweeper(
+            client,
+            interval_seconds=settings.reservation_gc_interval_seconds,
+            ttl_seconds=settings.reservation_ttl_seconds,
+        )
 
     def scan_recovery():
         return recovery.scan(
@@ -137,9 +149,13 @@ def create_app(
                 ", ".join(f"{issue.task_id}:{issue.kind.value}" for issue in issues),
             )
         outbox_worker.start()
+        if reservation_sweeper is not None:
+            reservation_sweeper.start()
         try:
             yield
         finally:
+            if reservation_sweeper is not None:
+                reservation_sweeper.stop()
             outbox_worker.stop()
             closer = getattr(client, "close", None)
             if callable(closer):
@@ -157,6 +173,7 @@ def create_app(
     app.state.graph = graph
     app.state.checkpointer = checkpointer
     app.state.outbox_worker = outbox_worker
+    app.state.reservation_sweeper = reservation_sweeper
 
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

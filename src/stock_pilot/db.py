@@ -123,7 +123,8 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     created_at    TEXT NOT NULL,
     delivered_at  TEXT,
     attempts      INTEGER NOT NULL DEFAULT 0,
-    last_error    TEXT
+    last_error    TEXT,
+    dead_lettered_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending
     ON outbox_events(id) WHERE delivered_at IS NULL;
@@ -278,6 +279,9 @@ def _migrate_mall(conn: sqlite3.Connection) -> None:
 def _migrate_orchestrator(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "tasks", "idempotency_key", "idempotency_key TEXT")
     _ensure_column(conn, "tasks", "submitted_by", "submitted_by TEXT")
+    _ensure_column(
+        conn, "outbox_events", "dead_lettered_at", "dead_lettered_at TEXT"
+    )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_idempotency_key"
         " ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL"

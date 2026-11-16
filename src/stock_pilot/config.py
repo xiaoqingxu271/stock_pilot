@@ -33,6 +33,15 @@ class Settings:
     # Notification outbox worker poll interval. Delivery is at least once and
     # never re-drives a tool write.
     outbox_interval_seconds: float = 2.0
+    # After this many failed sends an event is dead-lettered instead of being
+    # retried forever; delivered/dead rows are pruned after the retention
+    # window. Neither setting can trigger a tool write.
+    outbox_max_attempts: int = 5
+    outbox_retention_seconds: int = 7 * 24 * 60 * 60
+    # Opt-in background sweep for leaked stock reservations. Zero disables it
+    # (the default for demos); the sweep rule stays as conservative as the
+    # operator-triggered endpoint.
+    reservation_gc_interval_seconds: float = 0.0
     # Production split: two HTTP MCP servers over a shared demo database.
     inventory_mcp_url: str = "http://127.0.0.1:8101/mcp"
     mall_mcp_url: str = "http://127.0.0.1:8102/mcp"
@@ -54,6 +63,12 @@ class Settings:
             raise ValueError("reservation_ttl_seconds must be positive")
         if self.outbox_interval_seconds <= 0:
             raise ValueError("outbox_interval_seconds must be positive")
+        if self.outbox_max_attempts <= 0:
+            raise ValueError("outbox_max_attempts must be positive")
+        if self.outbox_retention_seconds <= 0:
+            raise ValueError("outbox_retention_seconds must be positive")
+        if self.reservation_gc_interval_seconds < 0:
+            raise ValueError("reservation_gc_interval_seconds must not be negative")
 
     @property
     def split_stores(self) -> bool:
@@ -104,6 +119,15 @@ class Settings:
             ),
             outbox_interval_seconds=float(
                 os.environ.get("STOCK_PILOT_OUTBOX_INTERVAL", "2")
+            ),
+            outbox_max_attempts=int(
+                os.environ.get("STOCK_PILOT_OUTBOX_MAX_ATTEMPTS", "5")
+            ),
+            outbox_retention_seconds=int(
+                os.environ.get("STOCK_PILOT_OUTBOX_RETENTION", "604800")
+            ),
+            reservation_gc_interval_seconds=float(
+                os.environ.get("STOCK_PILOT_RESERVATION_GC_INTERVAL", "0")
             ),
             inventory_mcp_url=os.environ.get(
                 "STOCK_PILOT_INVENTORY_URL", "http://127.0.0.1:8101/mcp"

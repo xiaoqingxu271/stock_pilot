@@ -14,6 +14,9 @@ orchestrator store.
 
 from __future__ import annotations
 
+import logging
+import threading
+
 from stock_pilot import tasks
 from stock_pilot.clients import ToolClient
 from stock_pilot.db import utcnow
@@ -31,6 +34,8 @@ from stock_pilot.models import (
     ReservationGcResponse,
     ReservationView,
 )
+
+logger = logging.getLogger(__name__)
 
 _RELEASABLE_APPROVALS = frozenset(
     {
@@ -160,3 +165,74 @@ def _sweep_one(
         action=action,
         reason=reason,
     )
+
+
+class ReservationSweeper:
+    """Opt-in periodic sweep that uses the exact operator-triggered rule.
+
+    Disabled by default (``STOCK_PILOT_RESERVATION_GC_INTERVAL=0``). The timer
+    only runs ``sweep()``; it cannot release a reservation whose approval can
+    still publish, so it does not weaken the saga's stock guarantee. It is a
+    convenience for long-running deployments, not a force-expiry mechanism.
+    """
+
+    def __init__(
+        self,
+        client: ToolClient,
+        *,
+        interval_seconds: float,
+        ttl_seconds: int,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        self.client = client
+        self.interval_seconds = interval_seconds
+        self.ttl_seconds = ttl_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="stock-pilot-reservation-gc",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5.0)
+        self._thread = None
+
+    def run_once(self) -> ReservationGcResponse:
+        result = sweep(self.client, ttl_seconds=self.ttl_seconds)
+        if result.released or result.failed:
+            logger.info(
+                "reservation sweep released=%d retained=%d stale=%d failed=%d",
+                result.released,
+                result.retained,
+                result.stale,
+                result.failed,
+            )
+        return result
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                self.run_once()
+            except Exception:  # noqa: BLE001 - a failed pass retries next tick
+                logger.exception("reservation sweep pass failed")
+
+    def __enter__(self) -> ReservationSweeper:
+        self.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.stop()

@@ -20,7 +20,7 @@ Add an outbox for **notifications only**, in `orchestrator.db`:
 | `dedupe_key` (unique) | `task-terminal:<task_id>:<status>`; repeated terminal updates keep one event |
 | `topic` | currently `task.terminal` |
 | `task_id`, `payload_json` | whitelisted task facts (sku, spec, status, listing/approval ids, final price cents, error code) |
-| `created_at`, `delivered_at`, `attempts`, `last_error` | delivery state |
+| `created_at`, `delivered_at`, `attempts`, `last_error`, `dead_lettered_at` | delivery state |
 
 ### Enqueue is transactional with the task
 
@@ -41,12 +41,23 @@ tests inject a recording or failing sender. The worker calls
   (at-least-once; consumers dedupe by `dedupe_key`);
 - sender failure → row stays pending, `attempts` increments, `last_error` is
   recorded, the next pass retries;
+- after `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS` failures (default 5) the row is
+  dead-lettered via `dead_lettered_at` and excluded from later passes. It is
+  visible to `stock_pilot_outbox_dead` and stays in the table for inspection;
 - the worker never imports or receives `ToolClient`, so it cannot call
   `publish_listing`, `update_price`, or any other MCP tool.
 
-`GET /metrics` exposes `stock_pilot_outbox_pending` derived from the
-orchestrator store. The API lifespan starts and stops the worker; tests and
-the demo do not need a separate process.
+### Retention
+
+Delivered and dead-lettered rows are pruned after
+`STOCK_PILOT_OUTBOX_RETENTION` (default 7 days). Pruning never touches pending
+rows and never touches `tasks` or `tool_events`; the notification row is not
+the audit record. The worker runs the prune at most once per hour.
+
+`GET /metrics` exposes `stock_pilot_outbox_pending` and
+`stock_pilot_outbox_dead`, both derived from the orchestrator store. The API
+lifespan starts and stops the worker; tests and the demo do not need a
+separate process.
 
 ## Consequences
 
@@ -56,9 +67,9 @@ the demo do not need a separate process.
   at-least-once delivery with an explicit dedupe key.
 - No new write can originate from the outbox. This is enforced structurally
   (no client dependency), not just by convention.
-- Remaining limits: only a log sender ships today; no dead-letter queue or
-  retention/GC for delivered rows; an external webhook/SNS sender can be
-  added behind the same interface without changing the write-side rules.
+- Remaining limit: only a log sender ships today; an external webhook/SNS
+  sender can be added behind the same interface without changing the
+  write-side rules.
 - Tests cover atomic enqueue and rollback, non-terminal no-op, dedupe,
-  delivery once, sender failure and retry, the pending metric, and lifespan
-  wiring end to end.
+  delivery once, sender failure and retry, dead-lettering after the attempt
+  budget, retention pruning, both metrics, and lifespan wiring end to end.

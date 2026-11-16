@@ -115,8 +115,13 @@ class StockPilotCollector:
         )
         yield self._gauge(
             "stock_pilot_outbox_pending",
-            "Notification events not yet delivered.",
+            "Notification events not yet delivered or dead-lettered.",
             notifications.pending_count(self.db_path),
+        )
+        yield self._gauge(
+            "stock_pilot_outbox_dead",
+            "Notification events dead-lettered after repeated failures.",
+            notifications.dead_count(self.db_path),
         )
         yield self._circuits()
         yield self._gauge(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -13,7 +14,7 @@ from helpers import wait_until
 from stock_pilot import notifications, tasks
 from stock_pilot.api import create_app
 from stock_pilot.config import Settings
-from stock_pilot.db import initialize_database
+from stock_pilot.db import initialize_database, iso, utcnow
 from stock_pilot.enums import TaskStatus
 from stock_pilot.metrics import render_metrics
 from stock_pilot.models import CreateTaskRequest
@@ -35,6 +36,15 @@ class FlakySender:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("notification endpoint down")
+
+
+class AlwaysFailSender:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def send(self, event: notifications.NotificationEvent) -> None:
+        self.calls += 1
+        raise RuntimeError("notification endpoint down")
 
 
 def make_task(db_path: str) -> str:
@@ -182,6 +192,125 @@ def test_pending_metric_reflects_undelivered_events(db_path: str):
 
     notifications.deliver_pending(db_path, RecordSender())
     assert "stock_pilot_outbox_pending 0.0" in render_metrics(db_path).decode()
+
+
+def test_exhausted_retries_dead_letter_the_event(db_path: str):
+    task_id = make_task(db_path)
+    tasks.update_task(db_path, task_id, status=TaskStatus.VERIFIED)
+    sender = AlwaysFailSender()
+
+    assert notifications.deliver_pending(db_path, sender, max_attempts=2) == 0
+    assert notifications.deliver_pending(db_path, sender, max_attempts=2) == 0
+
+    row = outbox_rows(db_path)[0]
+    assert row["delivered_at"] is None
+    assert row["dead_lettered_at"] is not None
+    assert row["attempts"] == 2
+    assert "down" in row["last_error"]
+    assert notifications.pending_count(db_path) == 0
+    assert notifications.dead_count(db_path) == 1
+
+    # Dead events are excluded from later delivery passes.
+    assert notifications.deliver_pending(db_path, sender, max_attempts=2) == 0
+    assert sender.calls == 2
+
+    text = render_metrics(db_path).decode()
+    assert "stock_pilot_outbox_pending 0.0" in text
+    assert "stock_pilot_outbox_dead 1.0" in text
+
+
+def test_worker_applies_attempt_budget(db_path: str):
+    task_id = make_task(db_path)
+    tasks.update_task(db_path, task_id, status=TaskStatus.VERIFIED)
+    worker = notifications.OutboxWorker(
+        db_path,
+        sender=AlwaysFailSender(),
+        interval_seconds=0.05,
+        max_attempts=1,
+        prune_interval_seconds=0,
+    )
+
+    assert worker.run_once() == 0
+    assert notifications.dead_count(db_path) == 1
+    assert notifications.pending_count(db_path) == 0
+
+
+def test_prune_removes_only_aged_delivered_and_dead_rows(db_path: str):
+    first = make_task(db_path)
+    second = make_task(db_path)
+    third = make_task(db_path)
+    tasks.update_task(db_path, first, status=TaskStatus.VERIFIED)
+    tasks.update_task(db_path, second, status=TaskStatus.ROLLED_BACK)
+    tasks.update_task(db_path, third, status=TaskStatus.VERIFIED)
+    notifications.deliver_pending(db_path, RecordSender())
+
+    old = iso(utcnow() - timedelta(days=8))
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE outbox_events SET delivered_at = ? WHERE task_id = ?",
+            (old, first),
+        )
+        conn.execute(
+            "UPDATE outbox_events SET delivered_at = NULL,"
+            " dead_lettered_at = ?, attempts = 5 WHERE task_id = ?",
+            (old, second),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # A pending row must survive pruning even if it is old.
+    fourth = make_task(db_path)
+    tasks.update_task(db_path, fourth, status=TaskStatus.ABORTED_NO_STOCK)
+
+    assert notifications.prune(db_path, retention_seconds=3600) == 2
+
+    remaining = {row["task_id"] for row in outbox_rows(db_path)}
+    assert remaining == {third, fourth}
+    assert notifications.pending_count(db_path) == 1
+    assert notifications.dead_count(db_path) == 0
+
+
+def test_prune_is_a_no_op_for_a_young_outbox(db_path: str):
+    task_id = make_task(db_path)
+    tasks.update_task(db_path, task_id, status=TaskStatus.VERIFIED)
+    notifications.deliver_pending(db_path, RecordSender())
+
+    assert notifications.prune(db_path, retention_seconds=3600) == 0
+    assert len(outbox_rows(db_path)) == 1
+
+
+def test_initialization_migrates_an_old_outbox_table(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE outbox_events ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " dedupe_key TEXT NOT NULL UNIQUE,"
+            " topic TEXT NOT NULL,"
+            " task_id TEXT,"
+            " payload_json TEXT NOT NULL,"
+            " created_at TEXT NOT NULL,"
+            " delivered_at TEXT,"
+            " attempts INTEGER NOT NULL DEFAULT 0,"
+            " last_error TEXT)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    initialize_database(path, seed=False)
+
+    conn = sqlite3.connect(path)
+    try:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(outbox_events)")
+        }
+    finally:
+        conn.close()
+    assert "dead_lettered_at" in columns
 
 
 def test_api_lifespan_worker_delivers_terminal_events(tmp_path):

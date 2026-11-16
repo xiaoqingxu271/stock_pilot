@@ -51,8 +51,19 @@ outside the release step.
 
 A force-expiring timer would be a second writer that can invalidate the
 reservation guarantee the saga depends on. Scheduling the same conservative
-sweep periodically is safe; changing its rule is not. Production can run
-`POST /reservations/gc` from a cron/ops job without changing semantics.
+sweep periodically is safe; changing its rule is not.
+
+`ReservationSweeper` therefore runs `sweep()` unchanged on an interval:
+
+- enabled only when `STOCK_PILOT_RESERVATION_GC_INTERVAL` is positive
+  (default `0`, off, in split layouts only);
+- the API lifespan starts and stops the thread; manual
+  `POST /reservations/gc` remains available;
+- a failed pass is logged and retried on the next tick, and never widens the
+  release rule.
+
+Production can still run `POST /reservations/gc` from a cron/ops job; both
+paths share the same decision function.
 
 ## Consequences
 
@@ -65,5 +76,8 @@ sweep periodically is safe; changing its rule is not. Production can run
 - Tests cover consumed/abandoned/missing approvals, terminal tasks, an active
   approved reservation that survives the sweep and still publishes, idempotent
   sweeps, operator auth, and stale metrics.
-- Remaining limitation: cleanup is operator- or scheduler-triggered, not an
-  in-process background task. No notification outbox was added.
+- Cleanup can be operator-triggered, scheduled in-process, or driven by an
+  external cron; all three call the same conservative rule.
+- Remaining limitation: the in-process timer is opt-in and has no leadership
+  election, so multi-instance deployments should enable it on one instance or
+  rely on an external scheduler.

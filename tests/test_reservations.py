@@ -14,6 +14,7 @@ from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
+from helpers import wait_until
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from stock_pilot import tasks
@@ -40,7 +41,7 @@ from stock_pilot.models import (
     ReserveInventoryInput,
 )
 from stock_pilot.recovery import scan
-from stock_pilot.reservations import disposition, sweep
+from stock_pilot.reservations import ReservationSweeper, disposition, sweep
 from stock_pilot.tools import StockPilotTools
 
 
@@ -346,6 +347,79 @@ def test_reservation_endpoints_are_noops_in_shared_layout(tmp_path):
         swept = client.post("/reservations/gc")
         assert swept.status_code == 200
         assert swept.json()["released"] == 0
+
+
+def test_settings_reject_negative_gc_interval(tmp_path):
+    with pytest.raises(ValueError, match="reservation_gc_interval_seconds"):
+        Settings(
+            db_path=str(tmp_path / "stock_pilot.db"),
+            reservation_gc_interval_seconds=-1,
+        )
+
+
+def test_background_sweeper_releases_orphan_and_stops(settings: Settings):
+    tools = StockPilotTools(settings)
+    set_reservation(settings.store_inventory, "apr-ghost", iso(utcnow()))
+
+    sweeper = ReservationSweeper(
+        tools, interval_seconds=0.05, ttl_seconds=900
+    )
+    with sweeper:
+        assert wait_until(
+            lambda: reserved_by(settings.store_inventory) is None, timeout=5
+        )
+    assert sweeper._thread is None
+
+
+def test_background_sweeper_never_steals_a_live_hold(
+    settings: Settings, tools: StockPilotTools, graph
+):
+    task = start_task(tools, graph, request())
+    tools.decide_approval(task.approval_id, ApprovalDecision.APPROVE)
+    tools.reserve_inventory(
+        ReserveInventoryInput(
+            inventory_record_id="INV-001", approval_id=task.approval_id
+        )
+    )
+
+    sweeper = ReservationSweeper(tools, interval_seconds=60, ttl_seconds=900)
+    result = sweeper.run_once()
+
+    assert result.retained == 1
+    assert result.released == 0
+    assert reserved_by(settings.store_inventory) == task.approval_id
+
+
+def test_api_lifespan_starts_sweeper_only_when_configured(tmp_path):
+    shared = Settings(db_path=str(tmp_path / "shared.db"))
+    shared_app = create_app(shared)
+    with TestClient(shared_app):
+        assert shared_app.state.reservation_sweeper is None
+
+    disabled = Settings(
+        db_path=str(tmp_path / "split-disabled.db"),
+        db_layout="split",
+        reservation_gc_interval_seconds=0,
+    )
+    disabled_app = create_app(disabled)
+    with TestClient(disabled_app):
+        assert disabled_app.state.reservation_sweeper is None
+
+    enabled = Settings(
+        db_path=str(tmp_path / "split-enabled.db"),
+        db_layout="split",
+        reservation_gc_interval_seconds=0.05,
+        reservation_ttl_seconds=900,
+    )
+    StockPilotTools(enabled)
+    set_reservation(enabled.store_inventory, "apr-ghost", iso(utcnow()))
+
+    enabled_app = create_app(enabled)
+    with TestClient(enabled_app):
+        assert enabled_app.state.reservation_sweeper is not None
+        assert wait_until(
+            lambda: reserved_by(enabled.store_inventory) is None, timeout=10
+        )
 
 
 def test_metrics_render_with_reservation_gauges(settings: Settings):
