@@ -24,6 +24,10 @@ class ToolTimeoutError(Exception):
     """The tool call exceeded its deadline. Outcome is unknown."""
 
 
+class ToolUnavailableError(Exception):
+    """The tool transport is unavailable (e.g. the MCP session is down)."""
+
+
 class CircuitOpenError(Exception):
     """The circuit breaker is open; the call was not attempted."""
 

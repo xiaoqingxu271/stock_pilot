@@ -19,6 +19,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from stock_pilot import tasks
+from stock_pilot.clients import ToolClient
 from stock_pilot.db import utcnow
 from stock_pilot.enums import (
     ApprovalDecision,
@@ -40,7 +41,6 @@ from stock_pilot.models import (
     UpdatePriceInput,
     VerificationResult,
 )
-from stock_pilot.tools import StockPilotTools
 
 TERMINAL = {
     TaskStatus.VERIFIED,
@@ -102,10 +102,10 @@ def _select_listing(result, listing_id: str | None):
 
 
 def build_graph(
-    tools: StockPilotTools,
+    client: ToolClient,
     checkpointer: BaseCheckpointSaver | None = None,
 ):
-    db_path = tools.settings.db_path
+    db_path = client.settings.db_path
 
     def finish(
         state: AgentState,
@@ -124,7 +124,7 @@ def build_graph(
     # -- 1. stock ---------------------------------------------------------
 
     def check_stock(state: AgentState) -> dict[str, Any]:
-        result = tools.check_inventory(
+        result = client.check_inventory(
             CheckInventoryInput(sku_id=state["sku_id"], spec=state["spec"])
         )
         if not result.ok:
@@ -148,7 +148,7 @@ def build_graph(
     # -- 2. mapping -------------------------------------------------------
 
     def resolve_listing(state: AgentState) -> dict[str, Any]:
-        result = tools.get_listing(GetListingInput(sku_id=state["sku_id"]))
+        result = client.get_listing(GetListingInput(sku_id=state["sku_id"]))
         if not result.ok:
             return finish(
                 state,
@@ -240,7 +240,7 @@ def build_graph(
 
     def _adopt_reconciled_pending(state: AgentState) -> dict[str, Any] | None:
         """One read-only reconciliation after a write timeout / conflict."""
-        result = tools.get_listing(GetListingInput(sku_id=state["sku_id"]))
+        result = client.get_listing(GetListingInput(sku_id=state["sku_id"]))
         listing = _select_listing(result, state.get("listing_id"))
         if listing is None or listing.pending is None:
             return None
@@ -269,7 +269,7 @@ def build_graph(
         }
 
     def stage_price(state: AgentState) -> dict[str, Any]:
-        result = tools.update_price(
+        result = client.update_price(
             UpdatePriceInput(
                 listing_id=state["listing_id"],
                 new_price=_target(state),
@@ -299,6 +299,7 @@ def build_graph(
 
         if result.error_code in (
             ErrorCode.TOOL_TIMEOUT,
+            ErrorCode.TOOL_UNAVAILABLE,
             ErrorCode.CIRCUIT_OPEN,
         ):
             adopted = _adopt_reconciled_pending(state)
@@ -335,7 +336,7 @@ def build_graph(
 
         # The approval queue is the source of truth; the resume payload only
         # wakes the graph.
-        approval = tools.get_approval(state["approval_id"])
+        approval = client.get_approval(state["approval_id"])
         if approval is None:
             return finish(
                 state, TaskStatus.ABORTED_FAILED, ErrorCode.APPROVAL_NOT_FOUND
@@ -376,7 +377,7 @@ def build_graph(
     # -- 5. atomic publish ------------------------------------------------
 
     def publish(state: AgentState) -> dict[str, Any]:
-        result = tools.publish_listing(
+        result = client.publish_listing(
             PublishListingInput(
                 listing_id=state["listing_id"],
                 approval_id=state["approval_id"],
@@ -393,10 +394,11 @@ def build_graph(
 
         if result.error_code in (
             ErrorCode.TOOL_TIMEOUT,
+            ErrorCode.TOOL_UNAVAILABLE,
             ErrorCode.CIRCUIT_OPEN,
             ErrorCode.APPROVAL_ALREADY_CONSUMED,
         ):
-            reconciled = tools.get_listing(GetListingInput(sku_id=state["sku_id"]))
+            reconciled = client.get_listing(GetListingInput(sku_id=state["sku_id"]))
             listing = _select_listing(reconciled, state.get("listing_id"))
             if (
                 listing is not None
@@ -437,7 +439,7 @@ def build_graph(
     # -- 6. final read-only verification ---------------------------------
 
     def verify(state: AgentState) -> dict[str, Any]:
-        result = tools.get_listing(GetListingInput(sku_id=state["sku_id"]))
+        result = client.get_listing(GetListingInput(sku_id=state["sku_id"]))
         if not result.ok:
             return finish(
                 state,
@@ -550,29 +552,29 @@ def thread_config(task_id: str) -> dict[str, Any]:
     return {"configurable": {"thread_id": task_id}}
 
 
-def start_task(tools: StockPilotTools, graph, request: CreateTaskRequest) -> TaskView:
-    task = tasks.create_task(tools.settings.db_path, request)
+def start_task(client: ToolClient, graph, request: CreateTaskRequest) -> TaskView:
+    task = tasks.create_task(client.settings.db_path, request)
     graph.invoke(initial_state(task), thread_config(task.task_id))
-    refreshed = tasks.get_task(tools.settings.db_path, task.task_id)
+    refreshed = tasks.get_task(client.settings.db_path, task.task_id)
     assert refreshed is not None
     return refreshed
 
 
-def resume_task(tools: StockPilotTools, graph, task_id: str, value: Any) -> TaskView:
+def resume_task(client: ToolClient, graph, task_id: str, value: Any) -> TaskView:
     graph.invoke(Command(resume=value), thread_config(task_id))
-    refreshed = tasks.get_task(tools.settings.db_path, task_id)
+    refreshed = tasks.get_task(client.settings.db_path, task_id)
     assert refreshed is not None
     return refreshed
 
 
 def decide_and_resume(
-    tools: StockPilotTools,
+    client: ToolClient,
     graph,
     approval_id: str,
     decision: ApprovalDecision,
     note: str | None = None,
 ) -> TaskView:
-    task = tasks.find_task_by_approval(tools.settings.db_path, approval_id)
+    task = tasks.find_task_by_approval(client.settings.db_path, approval_id)
     if task is None:
         raise ToolFailure(
             ErrorCode.APPROVAL_NOT_FOUND,
@@ -583,9 +585,9 @@ def decide_and_resume(
             ErrorCode.INVALID_STATE,
             f"task is {task.status.value}, not awaiting approval",
         )
-    tools.decide_approval(approval_id, decision, note)
+    client.decide_approval(approval_id, decision, note)
     return resume_task(
-        tools,
+        client,
         graph,
         task.task_id,
         {"decision": decision.value, "note": note},
@@ -593,9 +595,9 @@ def decide_and_resume(
 
 
 def confirm_mapping_and_resume(
-    tools: StockPilotTools, graph, task_id: str, listing_id: str
+    client: ToolClient, graph, task_id: str, listing_id: str
 ) -> TaskView:
-    task = tasks.get_task(tools.settings.db_path, task_id)
+    task = tasks.get_task(client.settings.db_path, task_id)
     if task is None:
         raise ToolFailure(ErrorCode.MAPPING_NOT_FOUND, f"task {task_id!r} not found")
     if task.status is not TaskStatus.SUSPENDED_AMBIGUOUS:
@@ -608,4 +610,4 @@ def confirm_mapping_and_resume(
             ErrorCode.MAPPING_MISMATCH,
             f"listing {listing_id!r} is not one of the task's candidates",
         )
-    return resume_task(tools, graph, task_id, {"listing_id": listing_id})
+    return resume_task(client, graph, task_id, {"listing_id": listing_id})

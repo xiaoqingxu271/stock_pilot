@@ -20,6 +20,7 @@ from stock_pilot.errors import (
     ToolExecutionError,
     ToolFailure,
     ToolTimeoutError,
+    ToolUnavailableError,
 )
 
 T = TypeVar("T")
@@ -110,6 +111,13 @@ class ToolExecutor:
             except ToolFailure:
                 # Deterministic business rule violation: retrying cannot help,
                 # and it must not trip the transport circuit breaker.
+                raise
+            except ToolUnavailableError:
+                # Transport down: retry reads, then surface as unavailable so
+                # the orchestrator can stop without further writes.
+                self._record_failure(name)
+                if attempt + 1 < attempts:
+                    continue
                 raise
             except Exception as exc:  # noqa: BLE001 - converted to structured error
                 self._record_failure(name)

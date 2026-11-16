@@ -88,15 +88,18 @@ python -m venv .venv
 ./.venv/Scripts/python.exe -m pytest tests/test_agent_acceptance.py -q
 ./.venv/Scripts/python.exe -m pytest tests/test_api.py -q
 
-# 启动 FastAPI（默认 127.0.0.1:8000）
+# 启动 FastAPI（默认 127.0.0.1:8000，工具进程内调用）
 ./.venv/Scripts/python.exe -m stock_pilot.api
 # 浏览器打开 http://127.0.0.1:8000/ 即审批台
 
-# 启动 MCP Server（stdio）
+# 启动 FastAPI，四个工具真实走 MCP stdio（客户端自动拉起子进程）
+STOCK_PILOT_TOOL_CLIENT=mcp ./.venv/Scripts/python.exe -m stock_pilot.api
+
+# 单独启动 MCP Server（stdio；通常由 MCPToolClient 自动拉起）
 ./.venv/Scripts/python.exe -m stock_pilot.mcp_server
 ```
 
-配置通过环境变量覆盖：`STOCK_PILOT_DB`、`STOCK_PILOT_TOOL_TIMEOUT`、`STOCK_PILOT_READ_RETRIES`、`STOCK_PILOT_CIRCUIT_THRESHOLD`、`STOCK_PILOT_CIRCUIT_COOLDOWN`、`STOCK_PILOT_MCP_TRANSPORT`、`STOCK_PILOT_HOST`、`STOCK_PILOT_PORT`。
+配置通过环境变量覆盖：`STOCK_PILOT_DB`、`STOCK_PILOT_TOOL_TIMEOUT`、`STOCK_PILOT_READ_RETRIES`、`STOCK_PILOT_CIRCUIT_THRESHOLD`、`STOCK_PILOT_CIRCUIT_COOLDOWN`、`STOCK_PILOT_TOOL_CLIENT`（`inprocess` 默认 / `mcp`）、`STOCK_PILOT_MCP_TRANSPORT`、`STOCK_PILOT_HOST`、`STOCK_PILOT_PORT`。
 
 ## 代码架构
 
@@ -114,6 +117,14 @@ python -m venv .venv
 - `runner.py`：每次调用有硬超时；只读工具可重试，写工具只执行一次；每个工具独立熔断器（连续失败达阈值后打开，冷却后半开）。`ToolFailure` 不计入熔断。
 - `tools.py`：`StockPilotTools` 门面，把超时/熔断/内部异常统一映射为 `TOOL_TIMEOUT` / `CIRCUIT_OPEN` / `INTERNAL_ERROR`。
 - `mcp_server.py`：MCP 2.x 中 `FastMCP` 已改名 `MCPServer`（`mcp.server.mcpserver`），不要再从 `mcp.server.fastmcp` 导入。工具用平铺参数接收，内部立即构造 Pydantic 输入模型，返回 Pydantic 输出模型（含 `outputSchema` / structuredContent）。
+
+**工具客户端边界（`clients.py`）**
+
+- `ToolClient` 协议：编排层只依赖四个工具方法 + `get_approval` / `decide_approval`。`create_tool_client()` 按 `STOCK_PILOT_TOOL_CLIENT` 返回实现，默认 `StockPilotTools`（进程内），`mcp` 时返回 `MCPToolClient`。
+- `MCPToolClient`：后台线程跑 asyncio 事件循环，用官方 SDK 的 `stdio_client` + `ClientSession` 长期持有会话；子进程命令为 `sys.executable -m stock_pilot.mcp_server`，注入 `STOCK_PILOT_DB`、`PYTHONPATH=src`、`PYTHONUTF8=1`。
+- 同步调用经 `asyncio.run_coroutine_threadsafe` 投递，仍复用 `ToolExecutor`，因此客户端侧的超时 / 只读重试 / 写不重试 / 熔断语义与进程内模式一致。传输层失败映射为 `TOOL_UNAVAILABLE`（读会重试直至熔断），业务 `ok=False` 原样透传。
+- 审批队列读写与决策留在编排进程本地（审批台是人机管理面，不属于四个 MCP 工具）；`MCPToolClient` 构造时会先 `initialize_database()`，保证任务/审批表存在。
+- 服务不可用或中途退出时，任务在第一次失败处落入安全终态（`ABORTED_UNKNOWN_STATE` 等），不会补发写操作；错误码可能是 `TOOL_UNAVAILABLE` 或已打开的 `CIRCUIT_OPEN`。
 
 **编排层**
 
@@ -144,7 +155,8 @@ python -m venv .venv
 - `tests/test_runner.py`：超时重试、熔断、写不重试、业务失败不计入熔断。
 - `tests/test_api.py`：三个 FastAPI 操作接口及错误码。
 - `tests/test_ui.py`：审批台静态资源、页面入口、审批队列联表数据与状态过滤。
+- `tests/test_mcp_client.py`：真实 MCP stdio 客户端——四个工具契约、完整工具链、图与 FastAPI 跑在 MCP 模式、服务不可用 / 中途退出时安全终止且零后续写。
 
 ## 实现状态
 
-工具层、MCP Server、LangGraph 状态机、FastAPI、审批台 UI、验收回归均已落地；`pytest -q` 当前 35 个用例通过。生产化拆分（库存/商城/审批各自独立 MCP Server、鉴权、审计日志、真实登录与操作者身份）尚未实现。
+工具层、MCP Server、真实 MCP stdio 客户端、LangGraph 状态机、FastAPI、审批台 UI、验收回归均已落地；`pytest -q` 当前 41 个用例通过。生产化拆分（库存/商城/审批各自独立 MCP Server、鉴权、审计日志、真实登录与操作者身份）尚未实现。

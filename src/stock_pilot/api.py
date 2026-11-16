@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -26,6 +27,7 @@ from stock_pilot.agent import (
     decide_and_resume,
     start_task,
 )
+from stock_pilot.clients import ToolClient, create_tool_client
 from stock_pilot.config import Settings
 from stock_pilot.enums import ApprovalStatus, ErrorCode
 from stock_pilot.errors import ToolFailure
@@ -63,23 +65,33 @@ def create_app(
     settings: Settings | None = None,
     tools: StockPilotTools | None = None,
     checkpointer=None,
+    tool_client: ToolClient | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
-    tools = tools or StockPilotTools(settings)
+    client: ToolClient = tool_client or tools or create_tool_client(settings)
     if checkpointer is None:
         conn = sqlite3.connect(settings.db_path, check_same_thread=False)
         checkpointer = SqliteSaver(conn)
 
-    graph = build_graph(tools, checkpointer)
+    graph = build_graph(client, checkpointer)
     db_path = settings.db_path
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        closer = getattr(client, "close", None)
+        if callable(closer):
+            closer()
 
     app = FastAPI(
         title="StockPilot",
         version="0.1.0",
         description="Inventory-driven repricing and publishing with approval gates.",
+        lifespan=lifespan,
     )
     app.state.settings = settings
-    app.state.tools = tools
+    app.state.tools = client
+    app.state.tool_client = client
     app.state.graph = graph
     app.state.checkpointer = checkpointer
 
@@ -92,7 +104,7 @@ def create_app(
 
     @app.post("/tasks", response_model=TaskView, status_code=201)
     def submit_task(request: CreateTaskRequest) -> TaskView:
-        return start_task(tools, graph, request)
+        return start_task(client, graph, request)
 
     @app.get("/tasks", response_model=list[TaskView])
     def list_task_records(limit: int = Query(default=100, ge=1, le=500)):
@@ -109,7 +121,7 @@ def create_app(
     def confirm_mapping(task_id: str, request: MappingConfirmRequest) -> TaskView:
         try:
             return confirm_mapping_and_resume(
-                tools, graph, task_id, request.listing_id
+                client, graph, task_id, request.listing_id
             )
         except ToolFailure as exc:
             raise _http_error(exc) from exc
@@ -118,7 +130,7 @@ def create_app(
     def decide(approval_id: str, request: ApprovalDecisionRequest) -> TaskView:
         try:
             return decide_and_resume(
-                tools, graph, approval_id, request.decision, request.note
+                client, graph, approval_id, request.decision, request.note
             )
         except ToolFailure as exc:
             raise _http_error(exc) from exc
