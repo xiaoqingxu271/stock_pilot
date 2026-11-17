@@ -14,6 +14,7 @@ import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
@@ -24,6 +25,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from stock_pilot import (
     approval,
     audit,
+    audit_export,
     auth,
     intake,
     mall,
@@ -60,6 +62,7 @@ from stock_pilot.models import (
     ApprovalDecisionRequest,
     ApprovalQueueItem,
     ApprovalView,
+    AuditExport,
     Capabilities,
     CreateTaskRequest,
     GetListingInput,
@@ -349,6 +352,27 @@ def create_app(
         _principal: Principal | None = Depends(_require(None)),
     ) -> list[RecoveryIssue]:
         return scan_recovery()
+
+    @app.get("/audit/export", response_model=AuditExport)
+    def export_audit_report(
+        since: datetime | None = Query(default=None),
+        until: datetime | None = Query(default=None),
+        limit: int = Query(
+            default=500, ge=1, le=audit_export.MAX_LIMIT
+        ),
+        _principal: Principal | None = Depends(_require(Role.OPERATOR)),
+    ) -> AuditExport:
+        """Read-only operator snapshot; no tool call and no write path."""
+        try:
+            return audit_export.export_audit(
+                db_path,
+                approval_db,
+                since=since,
+                until=until,
+                limit=limit,
+            )
+        except ToolFailure as exc:
+            raise _http_error(exc) from exc
 
     @app.get("/reservations", response_model=ListReservationsOutput)
     def list_stock_reservations(

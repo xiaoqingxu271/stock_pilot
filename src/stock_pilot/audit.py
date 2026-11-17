@@ -9,6 +9,7 @@ task failure.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -87,6 +88,21 @@ def make_event_sink(db_path: str) -> EventSink:
     return sink
 
 
+def tool_event_from_row(row: sqlite3.Row) -> ToolEvent:
+    return ToolEvent(
+        event_id=row["id"],
+        task_id=row["task_id"],
+        tool=row["tool"],
+        attempt=row["attempt"],
+        outcome=ToolOutcome(row["outcome"]),
+        error_code=(
+            ErrorCode(row["error_code"]) if row["error_code"] is not None else None
+        ),
+        latency_ms=row["latency_ms"],
+        created_at=parse_dt(row["created_at"]),
+    )
+
+
 def list_tool_events(db_path: str, task_id: str) -> list[ToolEvent]:
     conn = connect(db_path)
     try:
@@ -96,20 +112,4 @@ def list_tool_events(db_path: str, task_id: str) -> list[ToolEvent]:
         ).fetchall()
     finally:
         conn.close()
-    return [
-        ToolEvent(
-            event_id=row["id"],
-            task_id=row["task_id"],
-            tool=row["tool"],
-            attempt=row["attempt"],
-            outcome=ToolOutcome(row["outcome"]),
-            error_code=(
-                ErrorCode(row["error_code"])
-                if row["error_code"] is not None
-                else None
-            ),
-            latency_ms=row["latency_ms"],
-            created_at=parse_dt(row["created_at"]),
-        )
-        for row in rows
-    ]
+    return [tool_event_from_row(row) for row in rows]

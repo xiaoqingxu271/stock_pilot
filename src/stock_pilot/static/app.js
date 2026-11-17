@@ -65,6 +65,7 @@
     live: $("#live-indicator"),
     liveText: $("#live-text"),
     refresh: $("#refresh-btn"),
+    auditExport: $("#audit-export-btn"),
     recoveryPanel: $("#recovery-panel"),
     recoveryList: $("#recovery-list"),
     recoveryCount: $("#recovery-count"),
@@ -1178,8 +1179,33 @@
     });
   }
 
+  async function exportAudit() {
+    refs.auditExport.disabled = true;
+    try {
+      const snapshot = await api("/audit/export");
+      const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      link.href = url;
+      link.download = `stockpilot-audit-${stamp}.json`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toast("审计快照已导出（只读）", "success");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      refs.auditExport.disabled = false;
+    }
+  }
+
   function bindGlobal() {
     refs.refresh.addEventListener("click", () => refresh({ manual: true, force: true }));
+    refs.auditExport.addEventListener("click", exportAudit);
 
     document.addEventListener("focusout", () => {
       window.setTimeout(() => {

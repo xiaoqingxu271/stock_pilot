@@ -21,7 +21,7 @@ from stock_pilot.models import (
 )
 
 
-def _approval_view(row: sqlite3.Row) -> ApprovalView:
+def approval_from_row(row: sqlite3.Row) -> ApprovalView:
     return ApprovalView(
         approval_id=row["id"],
         listing_id=row["listing_id"],
@@ -51,7 +51,7 @@ def get_approval(db_path: str, approval_id: str) -> ApprovalView | None:
         ).fetchone()
     finally:
         conn.close()
-    return _approval_view(row) if row is not None else None
+    return approval_from_row(row) if row is not None else None
 
 
 def get_staging_for_approval(db_path: str, approval_id: str) -> StagingView | None:
@@ -92,7 +92,7 @@ def list_approvals(
             ).fetchall()
     finally:
         conn.close()
-    return [_approval_view(row) for row in rows]
+    return [approval_from_row(row) for row in rows]
 
 
 def list_queue(
@@ -222,7 +222,7 @@ def decide_approval(
             "SELECT * FROM approvals WHERE id = ?", (approval_id,)
         ).fetchone()
 
-    return _approval_view(updated)
+    return approval_from_row(updated)
 
 
 def abandon_approval(
@@ -272,7 +272,7 @@ def abandon_approval(
             updated = tx.execute(
                 "SELECT * FROM approvals WHERE id = ?", (approval_id,)
             ).fetchone()
-            return _approval_view(updated)
+            return approval_from_row(updated)
         if status is not ApprovalStatus.APPROVED:
             raise ToolFailure(
                 ErrorCode.APPROVAL_ALREADY_DECIDED,
@@ -298,4 +298,4 @@ def abandon_approval(
             "SELECT * FROM approvals WHERE id = ?", (approval_id,)
         ).fetchone()
 
-    return _approval_view(updated)
+    return approval_from_row(updated)

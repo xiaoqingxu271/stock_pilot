@@ -5,7 +5,7 @@
 ## 0. 启动（30 秒）
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q               # 157 passed
+./.venv/Scripts/python.exe -m pytest -q               # 163 passed
 ./.venv/Scripts/python.exe -m ruff check src tests
 ./.venv/Scripts/python.exe -m stock_pilot.demo        # http://127.0.0.1:8000/
 # --split 同时拉起两个 HTTP MCP Server 并拆成三个库；--fresh 只重建配置的演示库
@@ -142,7 +142,15 @@ curl -s -X POST localhost:8000/tasks/intake \
   -d '{"text":"把 SKU-TSHIRT-001 白色-M 调到 59 元，清库存"}'
 ```
 
-## 6. 收尾（30 秒）
+## 6. 审计导出（可选，20 秒）
+
+在审批台顶栏点「导出审计」，浏览器下载一份 JSON（或
+`GET /audit/export`，需 operator Token）。指出三点：它只读任务、审批、工具
+时间线与通知元数据；不包含 Token / API Key，也不返回通知 payload 或投递错误
+文本；导出前后任务与审批数据不变。`split` 布局下分别读取编排库与商城库，
+是操作员快照，不是备份。
+
+## 7. 收尾（30 秒）
 
 `GET /healthz` 返回数据库与工具客户端就绪状态（不可用时 503），部署层据此
 摘流量。整个设计文档见 `README.md`，关键取舍见 `docs/adr/`。

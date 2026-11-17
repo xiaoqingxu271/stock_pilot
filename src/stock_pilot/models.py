@@ -390,6 +390,36 @@ class OutboxEventView(BaseModel):
     last_error: str | None
 
 
+class AuditOutboxEvent(BaseModel):
+    """Notification metadata only: no payload body and no free-form last error."""
+
+    event_id: int
+    dedupe_key: str
+    topic: str
+    task_id: str | None
+    created_at: datetime
+    delivered_at: datetime | None
+    dead_lettered_at: datetime | None
+    attempts: int
+
+
+class AuditExport(BaseModel):
+    """One read-only audit snapshot across orchestrator and mall stores.
+
+    The export is assembled without a cross-store transaction, so concurrent
+    writers may land between queries. It never includes credentials or tool
+    payloads that are not already part of the public task/approval views.
+    """
+
+    generated_at: datetime
+    since: datetime | None = None
+    until: datetime | None = None
+    tasks: list[TaskView] = Field(default_factory=list)
+    approvals: list[ApprovalView] = Field(default_factory=list)
+    tool_events: list[ToolEvent] = Field(default_factory=list)
+    outbox: list[AuditOutboxEvent] = Field(default_factory=list)
+
+
 class HealthStatus(BaseModel):
     """Readiness snapshot; degraded means writes must not be accepted."""
 

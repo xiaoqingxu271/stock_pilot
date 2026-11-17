@@ -61,7 +61,7 @@ def find_task_by_idempotency_key(
         ).fetchone()
     finally:
         conn.close()
-    return _row_to_task(row) if row is not None else None
+    return task_from_row(row) if row is not None else None
 
 
 def get_task(db_path: str, task_id: str) -> TaskView | None:
@@ -70,7 +70,7 @@ def get_task(db_path: str, task_id: str) -> TaskView | None:
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     finally:
         conn.close()
-    return _row_to_task(row) if row is not None else None
+    return task_from_row(row) if row is not None else None
 
 
 def find_task_by_approval(db_path: str, approval_id: str) -> TaskView | None:
@@ -83,7 +83,7 @@ def find_task_by_approval(db_path: str, approval_id: str) -> TaskView | None:
         ).fetchone()
     finally:
         conn.close()
-    return _row_to_task(row) if row is not None else None
+    return task_from_row(row) if row is not None else None
 
 
 def list_tasks(db_path: str, limit: int = 100) -> list[TaskView]:
@@ -94,7 +94,7 @@ def list_tasks(db_path: str, limit: int = 100) -> list[TaskView]:
         ).fetchall()
     finally:
         conn.close()
-    return [_row_to_task(row) for row in rows]
+    return [task_from_row(row) for row in rows]
 
 
 def update_task(
@@ -158,7 +158,7 @@ def update_task(
     return task
 
 
-def _row_to_task(row: sqlite3.Row) -> TaskView:
+def task_from_row(row: sqlite3.Row) -> TaskView:
     candidates = (
         [ListingCandidate.model_validate(item) for item in json.loads(row["candidates_json"])]
         if row["candidates_json"]

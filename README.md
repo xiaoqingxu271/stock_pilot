@@ -122,6 +122,8 @@ curl -s -X POST localhost:8000/outbox/1/retry    # operator 重投死信（不�
 
 **观测性（E2）**：`GET /metrics` 输出 Prometheus 指标（任务状态、工具尝试与耗时、审批积压、恢复问题、熔断、工具客户端可用性），与 `/healthz`、`tool_events` 同源。设置 `STOCK_PILOT_LOG_FORMAT=json` 后每次工具尝试输出一行结构化日志（含 `task_id`、工具、结果、耗时，不含 Token）。MCP 客户端每 2 秒 ping 一次，断线后以 0.5s→10s 指数退避自动重连；重连只恢复传输，绝不重放写操作。指标含义、告警规则与日志字段见 `docs/observability.md`。
 
+**审计导出（P6）**：`GET /audit/export`（operator）只读返回一个 `AuditExport` 快照：任务、审批、工具尝试时间线与通知元数据，支持 `since` / `until`（UTC，左闭右开）和每类集合的 `limit`。输出不含 Token / API Key，也不返回通知 payload 或 `last_error` 自由文本；它不调用工具、不写任何表，`split` 布局下分别读取编排库与商城库。审批台顶栏提供「导出审计」按钮下载 JSON。设计见 `docs/adr/0009-audit-export-is-read-only.md`。
+
 ## 快速开始
 
 Windows Git Bash：
@@ -186,6 +188,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 | `GET` | `/approvals/queue` | 审批台联表队列（商品 + 任务上下文） |
 | `GET` | `/approvals/{id}` | 单条审批详情 |
 | `GET` | `/recovery` | 只读重启对账结果 |
+| `GET` | `/audit/export` | operator 审计快照（只读，支持时间窗与 limit） |
 | `GET` | `/healthz` | 就绪检查；不可用时 `503` + `status=degraded` |
 | `GET` | `/metrics` | Prometheus 文本格式指标（不做鉴权，供抓取） |
 
@@ -209,7 +212,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 157 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 163 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -219,6 +222,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_runner.py`：超时重试、熔断、写不重试、业务失败不计入熔断。
 - `tests/test_api.py`：FastAPI 操作接口、错误码与就绪检查。
 - `tests/test_ui.py`：审批台静态资源、队列联表、恢复入口、遗留提案清理、能力探测（`/capabilities`），以及自然语言草稿在确认前零写入。
+- `tests/test_audit_export.py`：审计快照包含任务/审批/工具事件/通知元数据，operator 鉴权、时间窗与 limit、倒置窗口拒绝、凭据不出现、split 跨库读取，以及导出前后各表行数不变。
 - `tests/test_mcp_client.py`：真实 MCP stdio 全链路、API/MCP 模式、服务不可用或中途退出时安全终止。
 - `tests/test_mcp_http.py`：两个 Streamable HTTP MCP Server 的工具路由、完整图链路、Bearer 校验与未授权时安全终止。
 - `tests/test_auth.py`：角色鉴权、跨角色拒绝、身份覆盖请求体、撤回操作人留痕、只读鉴权开关、admin 自审告警。
@@ -269,7 +273,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 - `docs/demo.md`：约 8 分钟的面试演示脚本，含失败路径与拆分/鉴权演示。
 - `docs/screenshots/console.png`：审批台截图（演示数据：待审批 / 映射歧义 / 已核对 / 库存终止）。
 - `docs/observability.md`：指标、告警规则、结构化日志与断线重连语义。
-- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理、三库与发布 saga、预留 TTL 与清理、通知 outbox、自然语言入口只做参数抽取的决策记录。
+- `docs/adr/`：两阶段提交、失败语义、拆分与鉴权、恢复与人工清理、三库与发布 saga、预留 TTL 与清理、通知 outbox、自然语言入口只做参数抽取、审计导出只读投影的决策记录。
 
 ## 设计取舍与生产化
 

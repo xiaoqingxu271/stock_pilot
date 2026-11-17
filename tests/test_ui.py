@@ -63,6 +63,7 @@ def test_ui_index_is_served(client):
     assert 'id="intake-text"' in response.text
     assert 'id="intake-draft-btn"' in response.text
     assert 'id="intake-confirm-btn"' in response.text
+    assert 'id="audit-export-btn"' in response.text
 
 
 def test_ui_static_assets_are_served(client):
@@ -84,6 +85,8 @@ def test_ui_static_assets_are_served(client):
     assert "/capabilities" in js.text
     assert "/tasks/intake" in js.text
     assert "intake-confirm-btn" in js.text
+    assert "/audit/export" in js.text
+    assert "audit-export-btn" in js.text
 
 
 def test_approval_queue_is_enriched_for_the_ui(client):
