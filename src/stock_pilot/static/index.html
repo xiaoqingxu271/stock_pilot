@@ -265,6 +265,31 @@
           </label>
           <div id="task-list" class="task-list" aria-live="polite"></div>
         </section>
+
+        <section class="panel" id="outbox-panel" aria-labelledby="outbox-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="outbox-title">通知投递</h2>
+              <p class="panel-sub">仅通知 outbox：重投只重发通知，不会重放任何业务写操作。</p>
+            </div>
+            <span class="count count-danger" id="outbox-dead-count" title="死信通知数">0</span>
+          </div>
+          <div class="outbox-stats" aria-label="通知投递统计">
+            <div class="outbox-stat">
+              <span>待投递</span>
+              <strong id="outbox-stat-pending">0</strong>
+            </div>
+            <div class="outbox-stat">
+              <span>已投递</span>
+              <strong id="outbox-stat-delivered">0</strong>
+            </div>
+            <div class="outbox-stat">
+              <span>死信</span>
+              <strong id="outbox-stat-dead">0</strong>
+            </div>
+          </div>
+          <div id="outbox-dead-list" class="stack" aria-live="polite"></div>
+        </section>
       </div>
     </div>
 

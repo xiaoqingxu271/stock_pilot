@@ -48,6 +48,8 @@
     approvals: [],
     tasks: [],
     recovery: [],
+    outboxSummary: null,
+    deadEvents: [],
     capabilities: null,
     intakeDraft: null,
     query: "",
@@ -102,6 +104,11 @@
     intakeConfirmRow: $("#intake-confirm-row"),
     intakeConfirmBtn: $("#intake-confirm-btn"),
     intakeDiscardBtn: $("#intake-discard-btn"),
+    outboxDeadCount: $("#outbox-dead-count"),
+    outboxStatPending: $("#outbox-stat-pending"),
+    outboxStatDelivered: $("#outbox-stat-delivered"),
+    outboxStatDead: $("#outbox-stat-dead"),
+    outboxDeadList: $("#outbox-dead-list"),
   };
 
   function h(tag, className, text) {
@@ -411,6 +418,89 @@
     refs.recoveryList.replaceChildren();
     issues.forEach((issue) =>
       refs.recoveryList.append(recoveryCard(issue))
+    );
+  }
+
+  // ------------------------------------------------------------------
+  // Notification outbox
+  // ------------------------------------------------------------------
+
+  function deadEventCard(event) {
+    const card = h("article", "outbox-card");
+
+    const head = h("div", "card-head");
+    const titleWrap = h("div");
+    titleWrap.append(
+      h("h3", "card-title", `事件 ${event.event_id} · ${event.topic}`),
+      h(
+        "p",
+        "card-meta",
+        `task ${event.task_id ? shortId(event.task_id) : "—"} · 尝试 ${
+          event.attempts
+        } 次 · ${formatDate(event.dead_lettered_at || event.created_at)}`
+      )
+    );
+
+    const retry = h("button", "btn btn-danger-outline btn-small", "重投");
+    retry.type = "button";
+    retry.title = "只重发通知，不会重放任何业务写操作";
+    head.append(titleWrap, retry);
+    card.append(head);
+
+    if (event.last_error) {
+      card.append(h("p", "outbox-error", event.last_error));
+    }
+
+    let busy = false;
+    retry.addEventListener("click", async () => {
+      if (busy) return;
+      busy = true;
+      retry.disabled = true;
+      retry.textContent = "重投中…";
+      state.mutating += 1;
+      try {
+        await api(`/outbox/${encodeURIComponent(event.event_id)}/retry`, {
+          method: "POST",
+          body: "{}",
+        });
+        toast("死信已重新入队，等待 worker 投递", "success");
+        await refresh({ force: true });
+      } catch (error) {
+        toast(error.message, "error");
+        retry.disabled = false;
+        retry.textContent = "重投";
+      } finally {
+        state.mutating -= 1;
+        busy = false;
+      }
+    });
+
+    return card;
+  }
+
+  function renderOutbox() {
+    const summary = state.outboxSummary;
+    const pending = summary ? summary.pending : 0;
+    const delivered = summary ? summary.delivered : 0;
+    const dead = summary ? summary.dead : 0;
+
+    refs.outboxDeadCount.textContent = String(dead);
+    refs.outboxStatPending.textContent = String(pending);
+    refs.outboxStatDelivered.textContent = String(delivered);
+    refs.outboxStatDead.textContent = String(dead);
+
+    refs.outboxDeadList.replaceChildren();
+    if (!state.deadEvents.length) {
+      refs.outboxDeadList.append(
+        emptyState(
+          "没有死信通知",
+          "投递连续失败、达到重试上限的事件会出现在这里，可由 operator 人工重投。"
+        )
+      );
+      return;
+    }
+    state.deadEvents.forEach((event) =>
+      refs.outboxDeadList.append(deadEventCard(event))
     );
   }
 
@@ -1051,15 +1141,25 @@
       state.pendingRender = true;
       return;
     }
+    const outboxCounts = state.outboxSummary
+      ? [
+          state.outboxSummary.pending,
+          state.outboxSummary.delivered,
+          state.outboxSummary.dead,
+        ]
+      : null;
     const signature = JSON.stringify([
       state.approvals,
       state.tasks,
       state.recovery,
+      outboxCounts,
+      state.deadEvents,
     ]);
     if (!force && signature === state.lastSignature) return;
     state.lastSignature = signature;
     renderStats();
     renderRecovery();
+    renderOutbox();
     renderApprovals();
     renderMappings();
     renderTasks();
@@ -1069,14 +1169,19 @@
     if (state.loading) return;
     state.loading = true;
     try {
-      const [approvals, tasks, recovery] = await Promise.all([
-        api("/approvals/queue"),
-        api("/tasks?limit=100"),
-        api("/recovery"),
-      ]);
+      const [approvals, tasks, recovery, outboxSummary, deadEvents] =
+        await Promise.all([
+          api("/approvals/queue"),
+          api("/tasks?limit=100"),
+          api("/recovery"),
+          api("/outbox/summary"),
+          api("/outbox?status=dead&limit=5"),
+        ]);
       state.approvals = Array.isArray(approvals) ? approvals : [];
       state.tasks = Array.isArray(tasks) ? tasks : [];
       state.recovery = Array.isArray(recovery) ? recovery : [];
+      state.outboxSummary = outboxSummary || null;
+      state.deadEvents = Array.isArray(deadEvents) ? deadEvents : [];
       state.lastUpdated = new Date();
       render(force);
       updateLive(true);

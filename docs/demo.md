@@ -5,7 +5,7 @@
 ## 0. 启动（30 秒）
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q               # 163 passed
+./.venv/Scripts/python.exe -m pytest -q               # 165 passed
 ./.venv/Scripts/python.exe -m ruff check src tests
 ./.venv/Scripts/python.exe -m stock_pilot.demo        # http://127.0.0.1:8000/
 # --split 同时拉起两个 HTTP MCP Server 并拆成三个库；--fresh 只重建配置的演示库
@@ -150,7 +150,14 @@ curl -s -X POST localhost:8000/tasks/intake \
 文本；导出前后任务与审批数据不变。`split` 布局下分别读取编排库与商城库，
 是操作员快照，不是备份。
 
-## 7. 收尾（30 秒）
+## 7. 通知投递面板（可选，20 秒）
+
+审批台下方「通知投递」显示 pending / delivered / dead 三个计数。正常情况下
+死信为 0；说明 `POST /outbox/{id}/retry` 只重发通知，worker 不持有工具客户端，
+所以即使人工重投也不可能重放 `update_price` / `publish_listing`。死信事件会
+列出 attempts 与 `last_error`，operator 可逐条重投。
+
+## 8. 收尾（30 秒）
 
 `GET /healthz` 返回数据库与工具客户端就绪状态（不可用时 503），部署层据此
 摘流量。整个设计文档见 `README.md`，关键取舍见 `docs/adr/`。

@@ -18,7 +18,7 @@ StockPilot 把「库存检查 → 商品映射 → 调价提案 → 人工审批
    - 拒绝 / 复核失败都丢弃 staging，不留「价格改了但没上架」。
 4. **两阶段提交**：`update_price` 在同一事务写 `staging` + `approvals`，商城不可见；`publish_listing` 在同一事务完成改价、上架、消费审批、提交 staging。审批拒绝时只丢 staging，商城从未写。
 5. **三库与 saga（可选讲）**：split 下库存、商城（含审批）、编排各一个 SQLite。商城看不到库存表，所以发布链路变成「复核 → 内部 `reserve_inventory` → 商城事务提交 → 回写任务 → 尽力释放」。商城提交后响应丢失时，只读 `get_listing` 采纳已提交事实，绝不重发写。
-6. **恢复与观测**：审批状态以数据库为准，进程重启后从 checkpoint 继续；`GET /recovery` 只读标注异常态；指标从 SQLite 权威状态派生，JSON 日志只输出白名单字段。任务终态还会写一条仅通知的 outbox 事件，由没有工具客户端的 worker 至少一次投递；`GET /audit/export` 给 operator 一份只读快照，不含凭据与通知 payload。
+6. **恢复与观测**：审批状态以数据库为准，进程重启后从 checkpoint 继续；`GET /recovery` 只读标注异常态；指标从 SQLite 权威状态派生，JSON 日志只输出白名单字段。任务终态还会写一条仅通知的 outbox 事件，由没有工具客户端的 worker 至少一次投递，审批台可查看三态计数并人工重投死信；`GET /audit/export` 给 operator 一份只读快照，不含凭据与通知 payload。
 7. **模型的位置（可选讲）**：`POST /tasks/intake` 让模型从自由文本抽取参数，但只返回不落库的草稿；审批台的草稿面板也只读展示，点确认才把四个字段发给 `POST /tasks`，审批与写保护原样执行。模型没有工具，注入最多得到一张错草稿。
 
 收尾一句：**系统的正确性来自「不确定时停止写入」和「每个写事实只有一个持久化点」，而不是来自重试。**

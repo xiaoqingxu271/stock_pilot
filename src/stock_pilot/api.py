@@ -70,6 +70,7 @@ from stock_pilot.models import (
     ListReservationsOutput,
     MappingConfirmRequest,
     OutboxEventView,
+    OutboxSummary,
     RecoveryIssue,
     ReservationGcResponse,
     TaskDraft,
@@ -409,6 +410,19 @@ def create_app(
                     detail=f"reservation sweep unavailable: {exc.message}",
                 ) from exc
             raise _http_error(exc) from exc
+
+    @app.get("/outbox/summary", response_model=OutboxSummary)
+    def outbox_summary(
+        _principal: Principal | None = Depends(_require(None)),
+    ) -> OutboxSummary:
+        """Read-only delivery counters; no message is sent or re-queued."""
+        pending, delivered, dead = notifications.state_counts(db_path)
+        return OutboxSummary(
+            checked_at=utcnow(),
+            pending=pending,
+            delivered=delivered,
+            dead=dead,
+        )
 
     @app.get("/outbox", response_model=list[OutboxEventView])
     def list_outbox_events(

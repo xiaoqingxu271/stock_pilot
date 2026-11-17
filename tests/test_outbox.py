@@ -183,6 +183,69 @@ def test_sender_failure_keeps_event_pending_for_retry(db_path: str):
     assert sender.calls == 2
 
 
+def test_state_counts_track_pending_delivered_and_dead(db_path: str):
+    first = make_task(db_path)
+    second = make_task(db_path)
+    tasks.update_task(db_path, first, status=TaskStatus.VERIFIED)
+    tasks.update_task(db_path, second, status=TaskStatus.VERIFIED)
+
+    assert notifications.state_counts(db_path) == (2, 0, 0)
+    assert notifications.deliver_pending(db_path, RecordSender(), limit=1) == 1
+    assert notifications.state_counts(db_path) == (1, 1, 0)
+
+    failed = AlwaysFailSender()
+    assert (
+        notifications.deliver_pending(
+            db_path, failed, limit=1, max_attempts=1
+        )
+        == 0
+    )
+    assert notifications.state_counts(db_path) == (0, 1, 1)
+    assert notifications.pending_count(db_path) == 0
+    assert notifications.dead_count(db_path) == 1
+
+
+def test_outbox_summary_endpoint_is_read_only(tmp_path):
+    settings = Settings(
+        db_path=str(tmp_path / "stock_pilot.db"),
+        outbox_interval_seconds=3600.0,
+    )
+    with TestClient(create_app(settings)) as client:
+        empty = client.get("/outbox/summary")
+        assert empty.status_code == 200
+        assert empty.json()["pending"] == 0
+        assert empty.json()["delivered"] == 0
+        assert empty.json()["dead"] == 0
+
+        created = client.post(
+            "/tasks",
+            json={
+                "sku_id": "SKU-HOODIE-003",
+                "spec": "黑色-L",
+                "target_price": "99.00",
+                "reason": "outbox 汇总测试",
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["status"] == "aborted_no_stock"
+
+        before = {
+            table: scalar(settings.db_path, f"SELECT COUNT(*) FROM {table}")
+            for table in ("tasks", "approvals", "tool_events", "outbox_events")
+        }
+        summary = client.get("/outbox/summary")
+        after = {
+            table: scalar(settings.db_path, f"SELECT COUNT(*) FROM {table}")
+            for table in ("tasks", "approvals", "tool_events", "outbox_events")
+        }
+
+    assert summary.status_code == 200
+    body = summary.json()
+    assert body["pending"] + body["delivered"] == 1
+    assert body["dead"] == 0
+    assert before == after
+
+
 def test_pending_metric_reflects_undelivered_events(db_path: str):
     task_id = make_task(db_path)
     tasks.update_task(db_path, task_id, status=TaskStatus.VERIFIED)

@@ -390,6 +390,15 @@ class OutboxEventView(BaseModel):
     last_error: str | None
 
 
+class OutboxSummary(BaseModel):
+    """Delivery health for the console; derived from outbox rows only."""
+
+    checked_at: datetime
+    pending: int
+    delivered: int
+    dead: int
+
+
 class AuditOutboxEvent(BaseModel):
     """Notification metadata only: no payload body and no free-form last error."""
 

@@ -56,10 +56,18 @@ HMAC-SHA256 signature (`X-StockPilot-Signature: sha256=...`). Delivery errors
 never include the URL, so a token embedded in it cannot reach a log.
 
 `GET /outbox` lists pending, delivered, or dead events (read-only).
-`POST /outbox/{id}/retry` (operator) clears `dead_lettered_at`, resets
-`attempts`, and lets the worker try again. It is idempotent for pending rows
-and refuses delivered rows. Neither endpoint imports or receives a tool
-client; a retry can only re-send a notification.
+`GET /outbox/summary` returns disjoint `pending` / `delivered` / `dead`
+counts from one read-only query, so the console can show delivery health
+without parsing Prometheus text. `POST /outbox/{id}/retry` (operator) clears
+`dead_lettered_at`, resets `attempts`, and lets the worker try again. It is
+idempotent for pending rows and refuses delivered rows. None of these
+endpoints imports or receives a tool client; a retry can only re-send a
+notification.
+
+The approval console's "通知投递" panel shows the three counters and the five
+most recent dead events with their `last_error`, and offers a retry button per
+event. The button calls the same operator-only retry endpoint. The panel is a
+view over existing state: it adds no new write, no sender, and no tool access.
 
 ### Retention
 
@@ -87,4 +95,5 @@ separate process.
 - Tests cover atomic enqueue and rollback, non-terminal no-op, dedupe,
   delivery once, sender failure and retry, dead-lettering after the attempt
   budget, retention pruning, webhook signing, dead-letter retry auth and
-  idempotency, both metrics, and lifespan wiring end to end.
+  idempotency, both metrics, the read-only summary endpoint, and lifespan
+  wiring end to end.

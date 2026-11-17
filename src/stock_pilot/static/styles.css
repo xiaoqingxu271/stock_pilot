@@ -330,6 +330,11 @@ a { color: var(--accent); }
   background: var(--info-soft);
 }
 
+.count-danger {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
 .stack {
   display: flex;
   flex-direction: column;
@@ -919,6 +924,59 @@ a { color: var(--accent); }
   margin-top: 9px;
   font-size: 11.5px;
   color: var(--faint);
+}
+
+/* ------------------------------------------------------------------ */
+/* Notification outbox                                                 */
+/* ------------------------------------------------------------------ */
+
+.outbox-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.outbox-stat {
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+
+.outbox-stat span {
+  display: block;
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--muted);
+}
+
+.outbox-stat strong {
+  display: block;
+  margin-top: 1px;
+  font-size: 20px;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.outbox-card {
+  padding: 12px 14px;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, #fffafa 0%, var(--danger-soft) 100%);
+  animation: rise-in 0.28s ease both;
+}
+
+.outbox-card .card-meta { margin-top: 2px; }
+
+.outbox-error {
+  margin-top: 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: #7f1d1d;
+  overflow-wrap: anywhere;
 }
 
 /* ------------------------------------------------------------------ */

@@ -187,26 +187,36 @@ def enqueue_terminal(tx: sqlite3.Connection, task_id: str) -> None:
     )
 
 
-def pending_count(db_path: str) -> int:
+def state_counts(db_path: str) -> tuple[int, int, int]:
+    """Return ``(pending, delivered, dead)`` from one read-only query.
+
+    Dead events never carry ``delivered_at``, so the three buckets are
+    disjoint. The console uses this as a compact delivery-health snapshot;
+    metrics reuse the same derived counts.
+    """
     conn = connect(db_path)
     try:
-        return conn.execute(
-            "SELECT COUNT(*) AS n FROM outbox_events"
-            " WHERE delivered_at IS NULL AND dead_lettered_at IS NULL"
-        ).fetchone()["n"]
+        row = conn.execute(
+            "SELECT"
+            " COALESCE(SUM(CASE WHEN delivered_at IS NULL"
+            "   AND dead_lettered_at IS NULL THEN 1 ELSE 0 END), 0) AS pending,"
+            " COALESCE(SUM(CASE WHEN delivered_at IS NOT NULL"
+            "   THEN 1 ELSE 0 END), 0) AS delivered,"
+            " COALESCE(SUM(CASE WHEN dead_lettered_at IS NOT NULL"
+            "   THEN 1 ELSE 0 END), 0) AS dead"
+            " FROM outbox_events"
+        ).fetchone()
     finally:
         conn.close()
+    return int(row["pending"]), int(row["delivered"]), int(row["dead"])
+
+
+def pending_count(db_path: str) -> int:
+    return state_counts(db_path)[0]
 
 
 def dead_count(db_path: str) -> int:
-    conn = connect(db_path)
-    try:
-        return conn.execute(
-            "SELECT COUNT(*) AS n FROM outbox_events"
-            " WHERE dead_lettered_at IS NOT NULL"
-        ).fetchone()["n"]
-    finally:
-        conn.close()
+    return state_counts(db_path)[2]
 
 
 _VIEW_COLUMNS = (

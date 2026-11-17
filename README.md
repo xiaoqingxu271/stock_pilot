@@ -110,7 +110,7 @@ curl -s -X POST localhost:8000/outbox/1/retry    # operator 重投死信（不�
 
 **预留 TTL 与清理（E5）**：`release_inventory` 是尽力补偿，进程若在预留后崩溃，库存会被长期占用。系统提供只读 `GET /reservations` 与 operator 触发的 `POST /reservations/gc`：清理只释放审批已 `consumed` / `rejected` / `abandoned`、审批缺失或任务已终态的预留；审批仍可发布且任务活跃的预留**绝不自动释放**。`STOCK_PILOT_RESERVATION_TTL`（默认 900 秒）只用于把超龄预留标记为 `reservation_stale` 并报警，不构成释放许可。`GET /recovery` 与审批台会显示 `reservation_orphaned` / `reservation_stale`，面板提供「释放遗留预留」按钮。长驻部署可设置 `STOCK_PILOT_RESERVATION_GC_INTERVAL`（秒，默认 0 关闭）让进程内定时器周期执行**同一个**保守清理；它不会因为超龄而释放审批仍可发布的预留。设计见 `docs/adr/0006-reservation-ttl-and-gc.md`。
 
-**仅通知 outbox（P2）**：任务进入终态时，`tasks` 更新与 `outbox_events` 在**同一事务**落库，`dedupe_key` 防止重复。API lifespan 启动的后台 worker 只持有数据库路径与 `NotificationSender`（默认写结构化日志），按至少一次投递；发送失败保留 pending 并累计 `attempts` / `last_error`；达到 `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS`（默认 60，默认轮询下约 2 分钟）后转入死信，不再无限重试，已投递/死信行超过 `STOCK_PILOT_OUTBOX_RETENTION`（默认 7 天）后由 worker 清理。它**不持有任何工具客户端**，所以结构上不可能重放 `publish_listing` 或 `update_price`——与 ADR 0005 的「不确定即停写」一致。指标 `stock_pilot_outbox_pending` / `stock_pilot_outbox_dead` 暴露积压与死信。配置 `STOCK_PILOT_WEBHOOK_URL` 后发送器改为带超时与可选 HMAC 签名的 webhook；`GET /outbox` 只读查看队列，`POST /outbox/{id}/retry`（operator）可重投死信，仍然不接触任何工具。设计见 `docs/adr/0007-notification-outbox.md`。
+**仅通知 outbox（P2）**：任务进入终态时，`tasks` 更新与 `outbox_events` 在**同一事务**落库，`dedupe_key` 防止重复。API lifespan 启动的后台 worker 只持有数据库路径与 `NotificationSender`（默认写结构化日志），按至少一次投递；发送失败保留 pending 并累计 `attempts` / `last_error`；达到 `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS`（默认 60，默认轮询下约 2 分钟）后转入死信，不再无限重试，已投递/死信行超过 `STOCK_PILOT_OUTBOX_RETENTION`（默认 7 天）后由 worker 清理。它**不持有任何工具客户端**，所以结构上不可能重放 `publish_listing` 或 `update_price`——与 ADR 0005 的「不确定即停写」一致。指标 `stock_pilot_outbox_pending` / `stock_pilot_outbox_dead` 暴露积压与死信。配置 `STOCK_PILOT_WEBHOOK_URL` 后发送器改为带超时与可选 HMAC 签名的 webhook；`GET /outbox` 只读查看队列，`GET /outbox/summary` 返回待投递 / 已投递 / 死信计数，`POST /outbox/{id}/retry`（operator）可重投死信，仍然不接触任何工具。审批台「通知投递」面板展示三项计数与最近死信（含 `last_error`），每条死信可人工重投；面板不新增任何写路径。设计见 `docs/adr/0007-notification-outbox.md`。
 
 **自然语言入口（P5）**：`POST /tasks/intake` 接受自由文本，模型只负责抽取 `sku_id` / `spec` / `target_price` / `reason`，经严格 Pydantic 校验后返回 `TaskDraft` 和 `warnings`。草稿**不落库、不调工具、不具备任何权限**；调用方确认后仍提交到 `POST /tasks`，所有库存、映射、审批与超时规则重新执行。入口默认关闭（`STOCK_PILOT_LLM=off`，返回 503）；开启 `anthropic` 需要可选的 `[llm]` extra 与本地环境变量中的 API Key。未知 SKU 不在入口处猜测，而是在 `check_inventory` 安全失败。审批台提供「自然语言草稿」面板：只读展示草稿，点「确认提交任务」才把四个任务字段发给 `POST /tasks`，不提供任何直接审批/发布按钮；`GET /capabilities` 只暴露 `intake_enabled` / `llm_model` / `db_layout` / `auth_enabled`，不含 Key。设计见 `docs/adr/0008-llm-intake-extracts-parameters-only.md`。
 
@@ -189,6 +189,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 | `GET` | `/approvals/{id}` | 单条审批详情 |
 | `GET` | `/recovery` | 只读重启对账结果 |
 | `GET` | `/audit/export` | operator 审计快照（只读，支持时间窗与 limit） |
+| `GET` | `/outbox/summary` | 通知投递计数（待投递 / 已投递 / 死信） |
 | `GET` | `/healthz` | 就绪检查；不可用时 `503` + `status=degraded` |
 | `GET` | `/metrics` | Prometheus 文本格式指标（不做鉴权，供抓取） |
 
@@ -212,7 +213,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 163 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 165 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -232,7 +233,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_reconnect.py`：HTTP MCP Server 停机 → 任务安全中止 → 同端口重启 → 自动重连 → 新任务完成，审计中只有一次成功 `publish_listing`。
 - `tests/test_split_stores.py`：三库隔离、预留互斥/幂等/释放、拆分 API 与指标跨库读取、MCP 预留工具路由，以及「商城已提交但响应丢失」时只读采纳且不重发写。
 - `tests/test_reservations.py`：清理只释放审批终止/缺失/任务终态的预留；活跃审批的预留即使超过 TTL 也只标记 stale 且仍能完成发布；清理幂等、operator 鉴权、恢复扫描与指标；进程内定时器只在显式配置时启动且不抢活跃预留。
-- `tests/test_outbox.py`：终态与通知同事务、入队失败回滚任务、重复终态去重、至少一次投递与失败重试、重试上限后转死信、保留期只清理已投递/死信行、pending/dead 指标、lifespan worker，以及零工具写入。
+- `tests/test_outbox.py`：终态与通知同事务、入队失败回滚任务、重复终态去重、至少一次投递与失败重试、重试上限后转死信、保留期只清理已投递/死信行、三态计数与 `/outbox/summary` 只读快照、pending/dead 指标、lifespan worker，以及零工具写入。
 - `tests/test_webhook.py`：webhook 请求体与 HMAC 签名、非 2xx 时错误不含 URL；`GET /outbox` 状态过滤、死信重投的 operator 鉴权与幂等、已投递/不存在事件拒绝，以及重投不触碰商城或工具审计。
 - `tests/test_intake.py`：草稿零写入、缺少理由的警告、缺字段/越界/多余字段拒绝、上游失败映射、默认关闭与 agent 鉴权、未知 SKU 安全失败、价格归一化、Anthropic 适配器与密钥不出现在 `repr(Settings)`。
 
