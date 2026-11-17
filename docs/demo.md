@@ -5,7 +5,7 @@
 ## 0. 启动（30 秒）
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q               # 165 passed
+./.venv/Scripts/python.exe -m pytest -q               # 176 passed
 ./.venv/Scripts/python.exe -m ruff check src tests
 ./.venv/Scripts/python.exe -m stock_pilot.demo        # http://127.0.0.1:8000/
 # --split 同时拉起两个 HTTP MCP Server 并拆成三个库；--fresh 只重建配置的演示库
@@ -141,6 +141,10 @@ curl -s -X POST localhost:8000/tasks/intake \
   -H 'Content-Type: application/json' \
   -d '{"text":"把 SKU-TSHIRT-001 白色-M 调到 59 元，清库存"}'
 ```
+
+入口默认按身份限流 10 次 / 60 秒；连续生成会返回 `429` 与 `Retry-After`。
+强调超限时模型没有被调用，任务流水仍为空，手工表单不受影响；这是单进程
+成本护栏，多实例部署要把真正配额放到网关或共享存储。
 
 ## 6. 审计导出（可选，20 秒）
 

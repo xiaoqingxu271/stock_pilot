@@ -138,6 +138,75 @@ def test_disabled_intake_returns_503(settings: Settings):
     assert "disabled" in response.json()["detail"]
 
 
+def test_intake_rate_limit_returns_429_without_calling_the_model(tmp_path):
+    settings = Settings(
+        db_path=str(tmp_path / "stock_pilot.db"),
+        intake_rate_limit=1,
+        intake_rate_window_seconds=3600.0,
+    )
+    fake = FakeLLM(valid_result())
+    with TestClient(create_app(settings, llm_client=fake)) as client:
+        first = client.post("/tasks/intake", json={"text": "调价"})
+        second = client.post("/tasks/intake", json={"text": "再调一次"})
+        tasks = client.get("/tasks").json()
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert second.json()["detail"].startswith("RATE_LIMITED")
+    assert int(second.headers["Retry-After"]) >= 1
+    assert fake.calls == ["调价"]
+    assert tasks == []
+    assert counts(settings.db_path)["tasks"] == 0
+
+
+def test_intake_rate_limit_is_per_authenticated_identity(tmp_path):
+    settings = Settings(
+        db_path=str(tmp_path / "stock_pilot.db"),
+        agent_token="agent-token",
+        operator_token="operator-token",
+        admin_token="admin-token",
+        intake_rate_limit=1,
+        intake_rate_window_seconds=3600.0,
+    )
+    fake = FakeLLM(valid_result())
+    with TestClient(create_app(settings, llm_client=fake)) as client:
+        first = client.post(
+            "/tasks/intake",
+            json={"text": "调价"},
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        limited = client.post(
+            "/tasks/intake",
+            json={"text": "再调一次"},
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        wrong_role = client.post(
+            "/tasks/intake",
+            json={"text": "operator 不能抽取"},
+            headers={"Authorization": "Bearer operator-token"},
+        )
+        admin = client.post(
+            "/tasks/intake",
+            json={"text": "admin 另行配额"},
+            headers={"Authorization": "Bearer admin-token"},
+        )
+
+    assert first.status_code == 200
+    assert limited.status_code == 429
+    assert wrong_role.status_code == 403
+    assert admin.status_code == 200
+    assert fake.calls == ["调价", "admin 另行配额"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("intake_rate_limit", -1), ("intake_rate_window_seconds", 0)],
+)
+def test_intake_rate_limit_settings_are_validated(tmp_path, field, value):
+    with pytest.raises(ValueError, match=field):
+        Settings(db_path=str(tmp_path / "pilot.db"), **{field: value})
+
+
 def test_intake_requires_the_agent_role(tmp_path):
     settings = Settings(
         db_path=str(tmp_path / "stock_pilot.db"),

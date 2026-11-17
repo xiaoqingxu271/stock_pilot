@@ -50,6 +50,11 @@ class Settings:
     llm_model: str = "claude-opus-5-5"
     llm_api_key: str | None = field(default=None, repr=False)
     llm_timeout_seconds: float = 10.0
+    # Cost guard for the model-backed endpoint. This is a per-process sliding
+    # window keyed by the authenticated principal (or one local bucket when
+    # auth is off). Zero disables it; it is not a distributed quota.
+    intake_rate_limit: int = 10
+    intake_rate_window_seconds: float = 60.0
     # Optional webhook delivery for the notification-only outbox. The sender
     # has no tool client and cannot re-drive a write.
     webhook_url: str | None = None
@@ -90,6 +95,10 @@ class Settings:
             raise ValueError("llm_api_key is required when llm_provider='anthropic'")
         if self.llm_timeout_seconds <= 0:
             raise ValueError("llm_timeout_seconds must be positive")
+        if self.intake_rate_limit < 0:
+            raise ValueError("intake_rate_limit must not be negative")
+        if self.intake_rate_window_seconds <= 0:
+            raise ValueError("intake_rate_window_seconds must be positive")
         if self.webhook_timeout_seconds <= 0:
             raise ValueError("webhook_timeout_seconds must be positive")
         if self.webhook_url is not None:
@@ -161,6 +170,12 @@ class Settings:
             llm_api_key=os.environ.get("STOCK_PILOT_LLM_API_KEY") or None,
             llm_timeout_seconds=float(
                 os.environ.get("STOCK_PILOT_LLM_TIMEOUT", "10")
+            ),
+            intake_rate_limit=int(
+                os.environ.get("STOCK_PILOT_INTAKE_RATE_LIMIT", "10")
+            ),
+            intake_rate_window_seconds=float(
+                os.environ.get("STOCK_PILOT_INTAKE_RATE_WINDOW", "60")
             ),
             webhook_url=os.environ.get("STOCK_PILOT_WEBHOOK_URL") or None,
             webhook_secret=os.environ.get("STOCK_PILOT_WEBHOOK_SECRET") or None,

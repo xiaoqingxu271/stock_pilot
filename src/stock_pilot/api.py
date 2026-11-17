@@ -30,6 +30,7 @@ from stock_pilot import (
     intake,
     mall,
     notifications,
+    ratelimit,
     recovery,
     reservations,
     tasks,
@@ -122,6 +123,10 @@ def create_app(
     settings = settings or Settings.from_env()
     client: ToolClient = tool_client or tools or create_tool_client(settings)
     llm = llm_client or intake.create_llm_client(settings)
+    intake_limiter = ratelimit.SlidingWindowLimiter(
+        settings.intake_rate_limit,
+        settings.intake_rate_window_seconds,
+    )
     if checkpointer is None:
         conn = sqlite3.connect(settings.db_path, check_same_thread=False)
         checkpointer = SqliteSaver(conn)
@@ -192,6 +197,7 @@ def create_app(
     app.state.outbox_worker = outbox_worker
     app.state.reservation_sweeper = reservation_sweeper
     app.state.llm_client = llm
+    app.state.intake_limiter = intake_limiter
 
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -302,14 +308,31 @@ def create_app(
     @app.post("/tasks/intake", response_model=TaskDraft)
     def intake_task(
         request: TaskIntakeRequest,
-        _principal: Principal | None = Depends(_require(Role.AGENT)),
+        principal: Principal | None = Depends(_require(Role.AGENT)),
     ) -> TaskDraft:
-        """Extract task parameters from free text. Draft only; never executes."""
+        """Extract task parameters from free text. Draft only; never executes.
+
+        The rate limit protects the only model-backed endpoint. It is checked
+        after the disabled check but before any upstream call, so a rejected
+        request costs nothing and creates no task.
+        """
         if llm is None:
             raise HTTPException(
                 status_code=503,
                 detail="natural-language intake is disabled"
                 " (set STOCK_PILOT_LLM=anthropic and STOCK_PILOT_LLM_API_KEY)",
+            )
+        bucket = principal.name if principal is not None else "local"
+        allowed, retry_after = intake_limiter.check(bucket)
+        if not allowed:
+            logger.warning("intake rate limit reached for %s", bucket)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"{ErrorCode.RATE_LIMITED.value}: too many intake requests;"
+                    f" retry in {retry_after}s"
+                ),
+                headers={"Retry-After": str(retry_after)},
             )
         try:
             return intake.extract_task(llm, request.text)
