@@ -289,6 +289,19 @@ class TaskDraft(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class Capabilities(BaseModel):
+    """Read-only deployment capabilities for the console.
+
+    Exposes no secrets: the model name is public configuration, while the API
+    key stays in the local environment and is never returned.
+    """
+
+    intake_enabled: bool
+    llm_model: str | None = None
+    db_layout: Literal["shared", "split"]
+    auth_enabled: bool
+
+
 class ApprovalDecisionRequest(StrictModel):
     decision: ApprovalDecision
     note: str | None = Field(default=None, max_length=500)

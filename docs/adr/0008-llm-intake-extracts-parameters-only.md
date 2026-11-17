@@ -44,6 +44,15 @@ POST /tasks          {draft} ->  the existing graph and all of its guards
      `repr=False`, and is never logged; errors carry no prompt or key;
    - tests inject a fake client, so CI performs no network calls and needs no
      credentials.
+6. The approval console surfaces the same flow without adding authority:
+   - `GET /capabilities` returns `intake_enabled`, `llm_model`, `db_layout`,
+     and `auth_enabled`; it never returns the API key;
+   - the panel posts free text to `POST /tasks/intake`, shows the returned
+     draft read-only inside page memory, and only a separate "confirm" button
+     submits the four task fields to `POST /tasks`;
+   - the draft is discarded on page refresh, and the panel offers no approve,
+     publish, or mapping shortcut. With intake off it shows an explanation and
+     the manual form remains available.
 
 ## Consequences
 
@@ -55,6 +64,9 @@ POST /tasks          {draft} ->  the existing graph and all of its guards
 - Intake adds one failure mode — upstream model errors — mapped to stable
   HTTP statuses (503 unavailable/timeout, 502 invalid output). No task is
   created on failure.
-- Not implemented: a console text box, model-assisted SKU disambiguation, and
-  any provider other than Anthropic. Ambiguity still goes to the human mapping
-  interrupt; the model is never asked to pick a listing.
+- Not implemented: model-assisted SKU disambiguation and any provider other
+  than Anthropic. Ambiguity still goes to the human mapping interrupt; the
+  model is never asked to pick a listing.
+- The console draft is deliberately not persisted. A refresh loses it, but
+  losing a draft is safer than giving a model-produced artifact durable
+  authority.

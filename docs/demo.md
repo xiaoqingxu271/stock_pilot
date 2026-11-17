@@ -5,7 +5,7 @@
 ## 0. 启动（30 秒）
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q               # 153 passed
+./.venv/Scripts/python.exe -m pytest -q               # 157 passed
 ./.venv/Scripts/python.exe -m ruff check src tests
 ./.venv/Scripts/python.exe -m stock_pilot.demo        # http://127.0.0.1:8000/
 # --split 同时拉起两个 HTTP MCP Server 并拆成三个库；--fresh 只重建配置的演示库
@@ -120,19 +120,27 @@ STOCK_PILOT_TOOL_CLIENT=mcp-http STOCK_PILOT_ADMIN_TOKEN=demo-admin-token \
 
 ## 5. 自然语言入口（可选，30 秒）
 
-主演示不需要任何模型 Key：入口默认关闭，`POST /tasks/intake` 返回 `503`，
-先说明「模型不在这条执行链上」。
+主演示不需要任何模型 Key：入口默认关闭，审批台的「自然语言草稿」面板会显示
+一行说明，`POST /tasks/intake` 返回 `503`。先说明「模型不在这条执行链上」，
+手工表单仍然可用。
 
 若本地配置了 `STOCK_PILOT_LLM=anthropic` 与 `STOCK_PILOT_LLM_API_KEY`：
+
+1. 刷新审批台，面板出现输入框，右上角显示模型名；`GET /capabilities` 只返回
+   `intake_enabled`、`llm_model`、`db_layout`、`auth_enabled`，不含 Key。
+2. 输入「把 SKU-TSHIRT-001 白色-M 调到 59 元，清库存」，点「生成草稿」。
+   面板展示只读的 SKU / 规格 / 目标价 / 理由与 warnings；此时任务流水仍为空。
+3. 点「确认提交任务」，前端只把四个任务字段发给 `POST /tasks`，随后照常进入
+   审批队列。强调三点：模型没有工具；多余字段、越界价格、缺失字段会被拒绝；
+   草稿只存在页面内存，5 秒自动刷新不重建，刷新页面即丢弃。
+
+也可以直接用命令行复现草稿：
 
 ```bash
 curl -s -X POST localhost:8000/tasks/intake \
   -H 'Content-Type: application/json' \
   -d '{"text":"把 SKU-TSHIRT-001 白色-M 调到 59 元，清库存"}'
 ```
-
-返回的是 `TaskDraft`（不落库、未执行）。强调三点：模型没有工具；多余字段、
-越界价格、缺失字段会被拒绝；确认后仍要 `POST /tasks` 走完整审批与写保护。
 
 ## 6. 收尾（30 秒）
 

@@ -112,7 +112,7 @@ curl -s -X POST localhost:8000/outbox/1/retry    # operator 重投死信（不�
 
 **仅通知 outbox（P2）**：任务进入终态时，`tasks` 更新与 `outbox_events` 在**同一事务**落库，`dedupe_key` 防止重复。API lifespan 启动的后台 worker 只持有数据库路径与 `NotificationSender`（默认写结构化日志），按至少一次投递；发送失败保留 pending 并累计 `attempts` / `last_error`；达到 `STOCK_PILOT_OUTBOX_MAX_ATTEMPTS`（默认 60，默认轮询下约 2 分钟）后转入死信，不再无限重试，已投递/死信行超过 `STOCK_PILOT_OUTBOX_RETENTION`（默认 7 天）后由 worker 清理。它**不持有任何工具客户端**，所以结构上不可能重放 `publish_listing` 或 `update_price`——与 ADR 0005 的「不确定即停写」一致。指标 `stock_pilot_outbox_pending` / `stock_pilot_outbox_dead` 暴露积压与死信。配置 `STOCK_PILOT_WEBHOOK_URL` 后发送器改为带超时与可选 HMAC 签名的 webhook；`GET /outbox` 只读查看队列，`POST /outbox/{id}/retry`（operator）可重投死信，仍然不接触任何工具。设计见 `docs/adr/0007-notification-outbox.md`。
 
-**自然语言入口（P5）**：`POST /tasks/intake` 接受自由文本，模型只负责抽取 `sku_id` / `spec` / `target_price` / `reason`，经严格 Pydantic 校验后返回 `TaskDraft` 和 `warnings`。草稿**不落库、不调工具、不具备任何权限**；调用方确认后仍提交到 `POST /tasks`，所有库存、映射、审批与超时规则重新执行。入口默认关闭（`STOCK_PILOT_LLM=off`，返回 503）；开启 `anthropic` 需要可选的 `[llm]` extra 与本地环境变量中的 API Key。未知 SKU 不在入口处猜测，而是在 `check_inventory` 安全失败。设计见 `docs/adr/0008-llm-intake-extracts-parameters-only.md`。
+**自然语言入口（P5）**：`POST /tasks/intake` 接受自由文本，模型只负责抽取 `sku_id` / `spec` / `target_price` / `reason`，经严格 Pydantic 校验后返回 `TaskDraft` 和 `warnings`。草稿**不落库、不调工具、不具备任何权限**；调用方确认后仍提交到 `POST /tasks`，所有库存、映射、审批与超时规则重新执行。入口默认关闭（`STOCK_PILOT_LLM=off`，返回 503）；开启 `anthropic` 需要可选的 `[llm]` extra 与本地环境变量中的 API Key。未知 SKU 不在入口处猜测，而是在 `check_inventory` 安全失败。审批台提供「自然语言草稿」面板：只读展示草稿，点「确认提交任务」才把四个任务字段发给 `POST /tasks`，不提供任何直接审批/发布按钮；`GET /capabilities` 只暴露 `intake_enabled` / `llm_model` / `db_layout` / `auth_enabled`，不含 Key。设计见 `docs/adr/0008-llm-intake-extracts-parameters-only.md`。
 
 **发布前复核**：审批可能持续数小时，库存不是审批时的快照。图在 `await_approval` 与 `publish` 之间增加 `recheck_stock`：库存不足、记录消失或复核工具失败时，系统不提交，而是把审批标记为 `abandoned` 并在同一事务里丢弃 staging；任务进入 `ROLLED_BACK`（库存不足）或 `ABORTED_UNKNOWN_STATE`（无法确认）。`abandoned` 不是人工拒绝，审计上区分开。
 
@@ -173,6 +173,8 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/tasks` | 提交任务；可选 `Idempotency-Key` 请求头 |
+| `POST` | `/tasks/intake` | 自然语言参数抽取，返回不落库草稿（默认关闭） |
+| `GET` | `/capabilities` | 审批台能力探测（入口开关 / 模型名 / 布局 / 鉴权，不含 Key） |
 | `GET` | `/tasks?limit=100` | 任务流水 |
 | `GET` | `/tasks/{id}` | 任务详情 |
 | `GET` | `/tasks/{id}/events` | 工具调用时间线（每次尝试的结果与耗时） |
@@ -207,7 +209,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 ## 测试
 
 ```bash
-./.venv/Scripts/python.exe -m pytest -q          # 153 个用例
+./.venv/Scripts/python.exe -m pytest -q          # 157 个用例
 ./.venv/Scripts/python.exe -m pytest tests/test_recovery.py -q
 ./.venv/Scripts/python.exe -m ruff check src tests
 ```
@@ -216,7 +218,7 @@ POSIX 把 `./.venv/Scripts/python.exe` 换成 `.venv/bin/python` 即可。
 - `tests/test_agent_acceptance.py`：图编排、映射恢复、写超时对账、拒绝/超时后零后续写。
 - `tests/test_runner.py`：超时重试、熔断、写不重试、业务失败不计入熔断。
 - `tests/test_api.py`：FastAPI 操作接口、错误码与就绪检查。
-- `tests/test_ui.py`：审批台静态资源、队列联表、恢复入口与遗留提案清理。
+- `tests/test_ui.py`：审批台静态资源、队列联表、恢复入口、遗留提案清理、能力探测（`/capabilities`），以及自然语言草稿在确认前零写入。
 - `tests/test_mcp_client.py`：真实 MCP stdio 全链路、API/MCP 模式、服务不可用或中途退出时安全终止。
 - `tests/test_mcp_http.py`：两个 Streamable HTTP MCP Server 的工具路由、完整图链路、Bearer 校验与未授权时安全终止。
 - `tests/test_auth.py`：角色鉴权、跨角色拒绝、身份覆盖请求体、撤回操作人留痕、只读鉴权开关、admin 自审告警。
@@ -280,7 +282,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 3. 静态 Token 换成 OIDC / 真实登录；只读鉴权已可通过 `STOCK_PILOT_REQUIRE_READ_AUTH` 开启，生产再接入统一网关。
 4. 指标与结构化日志已落地（Prometheus `/metrics`、JSON 日志）；生产再接入告警平台、日志聚合与审批审计导出。
 
-已知限制：SQLite 适合单实例演示；预留 TTL 只是观测门槛，超龄预留仍需按审批/任务状态清理；静态 Token 没有轮换与细粒度权限；admin 自审只告警不阻断（正常流程由角色分离保证审批人 ≠ 提交人）；自然语言入口默认关闭、目前只有 Anthropic 适配器，且尚未提供审批台输入框。
+已知限制：SQLite 适合单实例演示；预留 TTL 只是观测门槛，超龄预留仍需按审批/任务状态清理；静态 Token 没有轮换与细粒度权限；admin 自审只告警不阻断（正常流程由角色分离保证审批人 ≠ 提交人）；自然语言入口默认关闭、目前只有 Anthropic 适配器，草稿只存在审批台页面内存。
 
 ## License
 

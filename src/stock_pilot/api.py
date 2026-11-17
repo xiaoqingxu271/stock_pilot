@@ -60,6 +60,7 @@ from stock_pilot.models import (
     ApprovalDecisionRequest,
     ApprovalQueueItem,
     ApprovalView,
+    Capabilities,
     CreateTaskRequest,
     GetListingInput,
     HealthStatus,
@@ -228,6 +229,18 @@ def create_app(
     @app.get("/", include_in_schema=False)
     def approval_ui() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/capabilities", response_model=Capabilities)
+    def capabilities(
+        _principal: Principal | None = Depends(_require(None)),
+    ) -> Capabilities:
+        """Describe optional console features without exposing any secret."""
+        return Capabilities(
+            intake_enabled=llm is not None,
+            llm_model=settings.llm_model if llm is not None else None,
+            db_layout=settings.db_layout,
+            auth_enabled=auth.auth_enabled(settings),
+        )
 
     def _replay_existing(existing: TaskView, request: CreateTaskRequest) -> TaskView:
         if (

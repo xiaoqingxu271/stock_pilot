@@ -48,6 +48,8 @@
     approvals: [],
     tasks: [],
     recovery: [],
+    capabilities: null,
+    intakeDraft: null,
     query: "",
     loading: false,
     mutating: 0,
@@ -87,6 +89,18 @@
     statMapping: $("#stat-mapping"),
     statActive: $("#stat-active"),
     statFinished: $("#stat-finished"),
+    intakeState: $("#intake-state"),
+    intakeEnabled: $("#intake-enabled"),
+    intakeDisabled: $("#intake-disabled"),
+    intakeDisabledTitle: $("#intake-disabled-title"),
+    intakeDisabledHint: $("#intake-disabled-hint"),
+    intakeText: $("#intake-text"),
+    intakeHint: $("#intake-hint"),
+    intakeDraftBtn: $("#intake-draft-btn"),
+    intakeDraft: $("#intake-draft"),
+    intakeConfirmRow: $("#intake-confirm-row"),
+    intakeConfirmBtn: $("#intake-confirm-btn"),
+    intakeDiscardBtn: $("#intake-discard-btn"),
   };
 
   function h(tag, className, text) {
@@ -860,6 +874,177 @@
     refs.statFinished.textContent = String(finished);
   }
 
+  // ------------------------------------------------------------------
+  // Natural-language draft
+  // ------------------------------------------------------------------
+
+  function taskOutcomeHint(task) {
+    if (task.status === "awaiting_approval") {
+      return "提案已进入审批队列，等待人工审批。";
+    }
+    if (task.status === "suspended_ambiguous") {
+      return `任务已挂起，请在左侧候选列表中确认（${task.candidates.length} 个候选）。`;
+    }
+    if (task.status === "aborted_no_stock") {
+      return "库存 ≤ 0，任务在写操作前终止。";
+    }
+    return `任务状态：${statusMeta(task.status).label}`;
+  }
+
+  async function submitTaskPayload(payload, hintNode, button, idleText) {
+    button.disabled = true;
+    button.textContent = "提交中…";
+    state.mutating += 1;
+    try {
+      const task = await api("/tasks", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      hintNode.textContent = taskOutcomeHint(task);
+      toast(
+        `任务已创建：${statusMeta(task.status).label}`,
+        outcomeKind(task.status)
+      );
+      await refresh({ force: true });
+      return task;
+    } catch (error) {
+      hintNode.textContent = error.message;
+      toast(error.message, "error");
+      return null;
+    } finally {
+      button.disabled = false;
+      button.textContent = idleText;
+      state.mutating -= 1;
+    }
+  }
+
+  function renderCapabilities() {
+    const caps = state.capabilities;
+    if (!caps) {
+      refs.intakeState.textContent = "不可用";
+      refs.intakeEnabled.hidden = true;
+      refs.intakeDisabled.hidden = false;
+      refs.intakeDisabledTitle.textContent = "能力探测失败";
+      refs.intakeDisabledHint.textContent =
+        "无法读取 /capabilities；手工表单仍然可用。";
+      return;
+    }
+    refs.intakeState.textContent = caps.intake_enabled
+      ? caps.llm_model || "已启用"
+      : "未启用";
+    refs.intakeEnabled.hidden = !caps.intake_enabled;
+    refs.intakeDisabled.hidden = caps.intake_enabled;
+    if (!caps.intake_enabled) {
+      refs.intakeDisabledTitle.textContent = "自然语言入口未启用";
+      refs.intakeDisabledHint.textContent =
+        "设置 STOCK_PILOT_LLM=anthropic 与本地 STOCK_PILOT_LLM_API_KEY 后重启服务；也可继续用手工表单提交。";
+      state.intakeDraft = null;
+      renderIntakeDraft();
+    }
+  }
+
+  function renderIntakeDraft() {
+    const draft = state.intakeDraft;
+    refs.intakeDraft.replaceChildren();
+    refs.intakeDraft.hidden = !draft;
+    refs.intakeConfirmRow.hidden = !draft;
+    if (!draft) return;
+
+    const kv = h("dl", "kv");
+    addKv(kv, "SKU", draft.sku_id, true);
+    addKv(kv, "规格", draft.spec);
+    addKv(kv, "目标价", money(draft.target_price));
+    addKv(kv, "理由", draft.reason);
+    refs.intakeDraft.append(kv);
+
+    if (Array.isArray(draft.warnings) && draft.warnings.length) {
+      const warnings = h("div", "intake-warning");
+      draft.warnings.forEach((warning) => warnings.append(h("p", null, warning)));
+      refs.intakeDraft.append(warnings);
+    }
+    refs.intakeDraft.append(
+      h(
+        "p",
+        "intake-note",
+        "只读草稿：确认前没有创建任务，也没有调用任何工具。"
+      )
+    );
+  }
+
+  async function loadCapabilities() {
+    try {
+      state.capabilities = await api("/capabilities");
+    } catch (error) {
+      state.capabilities = null;
+      console.error(error);
+    }
+    renderCapabilities();
+  }
+
+  function bindIntake() {
+    refs.intakeDraftBtn.addEventListener("click", async () => {
+      const text = refs.intakeText.value.trim();
+      if (!text) {
+        toast("请先描述调价需求", "error");
+        refs.intakeText.focus();
+        return;
+      }
+      refs.intakeDraftBtn.disabled = true;
+      refs.intakeDraftBtn.textContent = "生成中…";
+      state.mutating += 1;
+      try {
+        const draft = await api("/tasks/intake", {
+          method: "POST",
+          body: JSON.stringify({ text }),
+        });
+        state.intakeDraft = draft;
+        renderIntakeDraft();
+        refs.intakeHint.textContent = `草稿已生成（${
+          (state.capabilities && state.capabilities.llm_model) || "模型"
+        }）。核对后点击确认提交才会创建任务。`;
+        toast("草稿已生成，尚未创建任务", "info");
+      } catch (error) {
+        state.intakeDraft = null;
+        renderIntakeDraft();
+        refs.intakeHint.textContent = error.message;
+        toast(error.message, "error");
+      } finally {
+        refs.intakeDraftBtn.disabled = false;
+        refs.intakeDraftBtn.textContent = "生成草稿";
+        state.mutating -= 1;
+      }
+    });
+
+    refs.intakeConfirmBtn.addEventListener("click", async () => {
+      const draft = state.intakeDraft;
+      if (!draft) return;
+      // Forward only the four task fields; warnings are console context.
+      const payload = {
+        sku_id: draft.sku_id,
+        spec: draft.spec,
+        target_price: String(draft.target_price),
+        reason: draft.reason,
+      };
+      const task = await submitTaskPayload(
+        payload,
+        refs.intakeHint,
+        refs.intakeConfirmBtn,
+        "确认提交任务"
+      );
+      if (task) {
+        state.intakeDraft = null;
+        renderIntakeDraft();
+      }
+    });
+
+    refs.intakeDiscardBtn.addEventListener("click", () => {
+      state.intakeDraft = null;
+      renderIntakeDraft();
+      refs.intakeHint.textContent = "草稿已丢弃，未创建任务。";
+      refs.intakeText.focus();
+    });
+  }
+
   function render(force = false) {
     if (hasActiveInput()) {
       state.pendingRender = true;
@@ -928,37 +1113,12 @@
         target_price: refs.price.value.trim(),
         reason: refs.reason.value.trim(),
       };
-
-      refs.submit.disabled = true;
-      refs.submit.textContent = "提交中…";
-      state.mutating += 1;
-      try {
-        const task = await api("/tasks", {
-          method: "POST",
-          body: JSON.stringify(payload),
-        });
-        if (task.status === "awaiting_approval") {
-          refs.formHint.textContent = "提案已进入审批队列，等待人工审批。";
-        } else if (task.status === "suspended_ambiguous") {
-          refs.formHint.textContent = `任务已挂起，请在左侧候选列表中确认（${task.candidates.length} 个候选）。`;
-        } else if (task.status === "aborted_no_stock") {
-          refs.formHint.textContent = "库存 ≤ 0，任务在写操作前终止。";
-        } else {
-          refs.formHint.textContent = `任务状态：${statusMeta(task.status).label}`;
-        }
-        toast(
-          `任务已创建：${statusMeta(task.status).label}`,
-          outcomeKind(task.status)
-        );
-        await refresh({ force: true });
-      } catch (error) {
-        refs.formHint.textContent = error.message;
-        toast(error.message, "error");
-      } finally {
-        refs.submit.disabled = false;
-        refs.submit.textContent = "提交任务";
-        state.mutating -= 1;
-      }
+      await submitTaskPayload(
+        payload,
+        refs.formHint,
+        refs.submit,
+        "提交任务"
+      );
     });
   }
 
@@ -1011,7 +1171,10 @@
       // When read auth is on, loading the page before entering a token gets
       // 401s; retry shortly after the operator types one.
       window.clearTimeout(tokenTimer);
-      tokenTimer = window.setTimeout(() => refresh({ force: true }), 400);
+      tokenTimer = window.setTimeout(() => {
+        loadCapabilities();
+        refresh({ force: true });
+      }, 400);
     });
   }
 
@@ -1037,9 +1200,11 @@
   }
 
   bindForm();
+  bindIntake();
   bindScenarios();
   bindFilter();
   bindOperator();
   bindGlobal();
+  loadCapabilities();
   refresh({ manual: true });
 })();

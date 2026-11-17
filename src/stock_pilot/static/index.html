@@ -166,6 +166,37 @@
       </div>
 
       <div class="column">
+        <section class="panel" id="intake-panel" aria-labelledby="intake-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="intake-title">自然语言草稿</h2>
+              <p class="panel-sub">模型只抽取参数；确认后仍走库存、映射与审批的全部检查。</p>
+            </div>
+            <span class="count count-info" id="intake-state">检测中</span>
+          </div>
+
+          <div id="intake-disabled" class="intake-disabled" hidden>
+            <strong id="intake-disabled-title">自然语言入口未启用</strong>
+            <p id="intake-disabled-hint">设置 <code>STOCK_PILOT_LLM=anthropic</code> 与本地 <code>STOCK_PILOT_LLM_API_KEY</code> 后重启服务；也可继续用手工表单提交。</p>
+          </div>
+
+          <div id="intake-enabled" hidden>
+            <label class="field">
+              <span>用一句话描述调价</span>
+              <textarea id="intake-text" rows="3" maxlength="2000" placeholder="例如：把 SKU-TSHIRT-001 白色-M 调到 59 元，理由是清库存"></textarea>
+            </label>
+            <div class="form-actions">
+              <button class="btn btn-ghost" id="intake-draft-btn" type="button">生成草稿</button>
+              <p class="form-hint" id="intake-hint">草稿不落库，也不会调用任何工具。</p>
+            </div>
+            <div id="intake-draft" class="intake-draft" hidden aria-live="polite"></div>
+            <div class="form-actions" id="intake-confirm-row" hidden>
+              <button class="btn btn-primary" id="intake-confirm-btn" type="button">确认提交任务</button>
+              <button class="btn btn-ghost" id="intake-discard-btn" type="button">丢弃草稿</button>
+            </div>
+          </div>
+        </section>
+
         <section class="panel" aria-labelledby="new-task-title">
           <div class="panel-head">
             <div>
