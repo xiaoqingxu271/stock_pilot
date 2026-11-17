@@ -29,14 +29,18 @@ curl -s localhost:8000/metrics | grep reservations
 curl -s localhost:8000/reservations          # 只读列出存活预留
 curl -s -X POST localhost:8000/reservations/gc   # operator 清理（无 Token 时本地开放）
 curl -s 'localhost:8000/outbox?status=dead'  # 只读查看死信通知
+curl -s localhost:8000/outbox/summary        # 待投递 / 已投递 / 死信计数
 curl -s -X POST localhost:8000/outbox/1/retry    # operator 重投死信（不重放写操作）
+curl -s localhost:8000/audit/export          # operator 只读审计快照
 ```
 
 ![StockPilot 审批台](docs/screenshots/console.png)
 
-页面左侧是审批队列、映射确认与执行链路；右侧提交任务并查看任务流水。截图对应：
-一次已通过的调价（¥59）、一个等待审批的第二轮提案（¥65）、一个因同名商品挂起的
-映射任务，以及一个库存为零直接终止的任务。
+页面左侧是审批队列、映射确认与执行链路；右侧是自然语言草稿、手工提交、任务流水
+与通知投递。截图对应：一次已核对（¥59）、一个等待审批的第二轮提案（¥68）、一个
+被拒绝回滚的提案（¥65）、一个因同名商品挂起的映射任务、一个库存为零直接终止的
+任务，以及已投递 3 条通知、死信为 0 的 outbox 面板。自然语言面板在未配置模型时
+显示关闭说明；顶栏可直接导出审计 JSON。
 
 ## 安全保证
 
@@ -273,6 +277,7 @@ tests/            验收、单元、API、UI、MCP、鉴权、恢复
 
 ## 文档
 
+- `CHANGELOG.md`：`v0.1.0` 能力清单、安全不变量与已知限制。
 - `docs/interview-notes.md`：3 分钟叙述、11 个高频追问、失败矩阵与已知边界。
 - `docs/demo.md`：约 8 分钟的面试演示脚本，含失败路径与拆分/鉴权演示。
 - `docs/screenshots/console.png`：审批台截图（演示数据：待审批 / 映射歧义 / 已核对 / 库存终止）。
